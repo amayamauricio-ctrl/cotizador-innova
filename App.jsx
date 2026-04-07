@@ -596,9 +596,14 @@ export default function InnovaV3() {
       <div class="page">
         ${ph(today)}
         <h2 class="section-title">Fotografías del Espacio</h2>
-        <div class="photos-grid">
-          ${eventPhotos.slice(0,6).map(p => `<img src="${p.url}" class="event-photo" alt="Espacio"/>`).join("")}
-        </div>
+        ${eventPhotos.length === 1
+          ? `<div style="text-align:center;margin-top:16px">
+               <img src="${eventPhotos[0].url}" alt="Espacio" style="width:90%;max-height:400px;object-fit:cover;border-radius:10px;border:1px solid #e0f5f8;display:inline-block"/>
+             </div>`
+          : `<div class="photos-grid">
+               ${eventPhotos.slice(0,6).map(p => `<img src="${p.url}" class="event-photo" alt="Espacio"/>`).join("")}
+             </div>`
+        }
         ${pf(data)}
       </div>` : "";
 
@@ -699,8 +704,8 @@ body{font-family:'Nunito','Century Gothic',Arial,sans-serif;font-size:10.5pt;col
 .cat-sum-total{font-size:16pt;font-weight:700;color:${BRAND.azul}}
 
 /* photos */
-.photos-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-top:8px}
-.event-photo{width:100%;height:140px;object-fit:cover;border-radius:6px;border:1px solid #e0f5f8}
+.photos-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:16px;margin-top:12px}
+.event-photo{width:100%;height:260px;object-fit:cover;border-radius:8px;border:1px solid #e0f5f8}
 
 /* conditions */
 .cond-title{font-size:19pt;font-weight:800;color:${BRAND.gris};margin-bottom:4px}
