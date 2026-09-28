@@ -908,6 +908,12 @@ ${photosHTML}
           INNOVA <span style={{ color:"#f0a500" }}>INSIGHT</span>
           <span style={{ fontSize:"9pt", color:"#7aaed4", fontFamily:"inherit", fontWeight:"300", marginLeft:"12px" }}>Cotizador v3</span>
         </div>
+        <button
+          onClick={() => { setApiKeyInput(""); setShowApiSetup(true); }}
+          title="Cambiar la API Key de Anthropic"
+          style={{ background:"transparent", border:"1px solid rgba(255,255,255,.25)", color:"#7aaed4", borderRadius:"8px", padding:"6px 12px", cursor:"pointer", fontSize:"9pt", fontFamily:"inherit" }}>
+          🔑 Cambiar API Key
+        </button>
       </div>
 
       <div style={{ maxWidth:"800px", margin:"0 auto", padding:"28px 20px 60px" }}>
