@@ -315,7 +315,7 @@ export default function InnovaV3() {
           method:"POST",
           headers:{ "Content-Type":"application/json", "x-api-key": apiKey, "anthropic-version": "2023-06-01", "anthropic-dangerous-direct-browser-access": "true" },
           body: JSON.stringify({
-            model:"claude-sonnet-4-6",
+            model:"claude-sonnet-5-5",
             max_tokens:2000,
             system: PROMPTS.servicios,
             messages:[{ role:"user", content: preciosUser }]
@@ -339,7 +339,7 @@ export default function InnovaV3() {
         const res = await fetchWithTimeout("https://api.anthropic.com/v1/messages", {
           method:"POST",
           headers:{ "Content-Type":"application/json", "x-api-key": apiKey, "anthropic-version": "2023-06-01", "anthropic-dangerous-direct-browser-access": "true" },
-          body: JSON.stringify({ model:"claude-sonnet-4-6", max_tokens:2000, system:PROMPTS[quoteType], messages }),
+          body: JSON.stringify({ model:"claude-sonnet-5-5", max_tokens:2000, system:PROMPTS[quoteType], messages }),
         });
         const resp = await res.json();
         if (resp.error) throw new Error(resp.error.message);
