@@ -14,6 +14,85 @@ const isOffice = (f) => /\.(xlsx|xls|pptx|ppt|docx|doc)$/i.test(f.name);
 const isWord = (f) => /\.(docx|doc)$/i.test(f.name);
 const MEDIA = { "image/png":"image/png","image/jpeg":"image/jpeg","image/jpg":"image/jpeg","image/webp":"image/webp","application/pdf":"application/pdf" };
 
+// ─── ARCHIVOS GRANDES ─────────────────────────────────────────────────────────
+// Anthropic rechaza solicitudes muy pesadas (y el navegador lo muestra como error CORS).
+// Los PDFs pequeños se envían tal cual; los grandes se convierten a texto,
+// o a imágenes comprimidas si el PDF es escaneado (sin texto).
+const PDFJS_URL    = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.10.38/pdf.min.mjs";
+const PDFJS_WORKER = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.10.38/pdf.worker.min.mjs";
+const MAX_PDF_DIRECT_BYTES = 4 * 1024 * 1024;   // PDFs de hasta 4 MB se envían completos
+const MAX_IMAGE_BYTES      = 3.5 * 1024 * 1024; // imágenes más pesadas se comprimen
+const MAX_SCANNED_PAGES    = 20;                 // páginas máximas si el PDF es escaneado
+const MAX_PDF_TEXT_CHARS   = 80000;
+const MAX_REQUEST_BYTES    = 28 * 1024 * 1024;  // límite de seguridad por solicitud
+
+let _pdfjs = null;
+const loadPdfJs = async () => {
+  if (!_pdfjs) {
+    _pdfjs = await import(/* @vite-ignore */ PDFJS_URL);
+    _pdfjs.GlobalWorkerOptions.workerSrc = PDFJS_WORKER;
+  }
+  return _pdfjs;
+};
+
+const canvasToJpegBase64 = (canvas, quality = 0.7) =>
+  canvas.toDataURL("image/jpeg", quality).split(",")[1];
+
+// Devuelve bloques de contenido para la API a partir de un PDF grande
+const shrinkPdf = async (file) => {
+  const pdfjs = await loadPdfJs();
+  const pdf = await pdfjs.getDocument({ data: await toArrayBuffer(file) }).promise;
+
+  // 1) Intentar extraer texto
+  let text = "";
+  for (let p = 1; p <= pdf.numPages; p++) {
+    const page = await pdf.getPage(p);
+    const tc = await page.getTextContent();
+    text += `\n--- Página ${p} ---\n` + tc.items.map(i => i.str).join(" ");
+  }
+  const realChars = text.replace(/--- Página \d+ ---/g, "").replace(/\s+/g, "").length;
+  if (realChars >= 40 * pdf.numPages) {
+    const recortado = text.length > MAX_PDF_TEXT_CHARS;
+    return [{ type:"text", text:`[Contenido extraído del PDF ${file.name} (${pdf.numPages} páginas)${recortado ? ", recortado por tamaño" : ""}]:\n${text.substring(0, MAX_PDF_TEXT_CHARS)}` }];
+  }
+
+  // 2) PDF escaneado: convertir páginas a imágenes JPEG comprimidas
+  const blocks = [];
+  const total = Math.min(pdf.numPages, MAX_SCANNED_PAGES);
+  for (let p = 1; p <= total; p++) {
+    const page = await pdf.getPage(p);
+    const base = page.getViewport({ scale: 1 });
+    const scale = Math.min(2, 1400 / base.width);
+    const viewport = page.getViewport({ scale });
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.round(viewport.width);
+    canvas.height = Math.round(viewport.height);
+    await page.render({ canvasContext: canvas.getContext("2d"), viewport }).promise;
+    blocks.push({ type:"image", source:{ type:"base64", media_type:"image/jpeg", data: canvasToJpegBase64(canvas) } });
+  }
+  if (pdf.numPages > total) {
+    blocks.push({ type:"text", text:`[Nota: ${file.name} tiene ${pdf.numPages} páginas; solo se enviaron las primeras ${total}.]` });
+  }
+  return blocks;
+};
+
+// Reduce una imagen pesada a máx. 2000 px y JPEG
+const compressImage = (file) => new Promise((res, rej) => {
+  const img = new Image();
+  const url = URL.createObjectURL(file);
+  img.onload = () => {
+    const scale = Math.min(1, 2000 / Math.max(img.width, img.height));
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.round(img.width * scale);
+    canvas.height = Math.round(img.height * scale);
+    canvas.getContext("2d").drawImage(img, 0, 0, canvas.width, canvas.height);
+    URL.revokeObjectURL(url);
+    res(canvasToJpegBase64(canvas, 0.8));
+  };
+  img.onerror = (e) => { URL.revokeObjectURL(url); rej(e); };
+  img.src = url;
+});
+
 // Extrae texto de archivos Word usando mammoth
 const extractWordText = async (file) => {
   try {
@@ -239,11 +318,25 @@ export default function InnovaV3() {
         blocks.push({ type:"text", text:`\n[PROVEEDOR: ${entry.category}${entry.venue ? ` | Venue/Lugar: ${entry.venue}` : ""} | Archivo: ${entry.file.name}]` });
         const f = entry.file;
         if (isImage(f)) {
-          const b64 = await toBase64(f);
-          blocks.push({ type:"image", source:{ type:"base64", media_type: MEDIA[f.type]||"image/jpeg", data:b64 } });
+          if (f.size > MAX_IMAGE_BYTES) {
+            const b64 = await compressImage(f);
+            blocks.push({ type:"image", source:{ type:"base64", media_type:"image/jpeg", data:b64 } });
+          } else {
+            const b64 = await toBase64(f);
+            blocks.push({ type:"image", source:{ type:"base64", media_type: MEDIA[f.type]||"image/jpeg", data:b64 } });
+          }
         } else if (isPDF(f)) {
-          const b64 = await toBase64(f);
-          blocks.push({ type:"document", source:{ type:"base64", media_type:"application/pdf", data:b64 } });
+          if (f.size > MAX_PDF_DIRECT_BYTES) {
+            try {
+              blocks.push(...await shrinkPdf(f));
+            } catch (err) {
+              console.error("[Cotizador] No se pudo reducir el PDF", f.name, err);
+              throw new Error(`El PDF "${f.name}" es muy pesado (${(f.size/1024/1024).toFixed(1)} MB) y no se pudo procesar. Comprímelo (ej. ilovepdf.com) o pega su contenido en información adicional.`);
+            }
+          } else {
+            const b64 = await toBase64(f);
+            blocks.push({ type:"document", source:{ type:"base64", media_type:"application/pdf", data:b64 } });
+          }
         } else if (isText(f)) {
           blocks.push({ type:"text", text: await f.text() });
         } else if (isWord(f)) {
@@ -260,11 +353,15 @@ export default function InnovaV3() {
         }
       }
     }
+    const approxBytes = JSON.stringify(blocks).length;
+    if (approxBytes > MAX_REQUEST_BYTES) {
+      throw new Error(`Los archivos suman demasiado (${(approxBytes/1024/1024).toFixed(1)} MB). Quita alguno o comprímelo antes de generar.`);
+    }
     return [{ role:"user", content:blocks }];
   };
 
   // ── Analyze ──
-  const fetchWithTimeout = async (url, options, timeoutMs = 60000) => {
+  const fetchWithTimeout = async (url, options, timeoutMs = 180000) => {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
@@ -274,7 +371,7 @@ export default function InnovaV3() {
     } catch (e) {
       clearTimeout(timer);
       if (e.name === "AbortError") throw new Error("Tiempo de espera agotado. Usa el modo manual o intenta de nuevo.");
-      throw new Error("Sin conexión con la IA. Usa el modo manual ↓");
+      throw new Error("Sin conexión con la IA (" + (e.message || e.name) + "). Revisa la Console (F12).");
     }
   };
 
@@ -322,7 +419,7 @@ export default function InnovaV3() {
           }),
         });
         const resp2 = await res2.json();
-        if (resp2.error) throw new Error(resp2.error.message);
+        if (resp2.error) throw new Error(`[${res2.status} ${resp2.error.type}] ${resp2.error.message}`);
         const raw2 = resp2.content?.map(b => b.text||"").join("") || "";
         const match2 = raw2.match(/\{[\s\S]*\}/);
         if (!match2) throw new Error("La IA no retornó JSON válido. Intenta de nuevo.");
@@ -342,7 +439,7 @@ export default function InnovaV3() {
           body: JSON.stringify({ model:"claude-sonnet-5-5", max_tokens:2000, system:PROMPTS[quoteType], messages }),
         });
         const resp = await res.json();
-        if (resp.error) throw new Error(resp.error.message);
+        if (resp.error) throw new Error(`[${res.status} ${resp.error.type}] ${resp.error.message}`);
         const raw = resp.content?.map(b => b.text||"").join("") || "";
         let jsonStr = raw;
         const match = raw.match(/\{[\s\S]*/);
@@ -389,11 +486,8 @@ export default function InnovaV3() {
 
     } catch(e) {
       const msg = e.message || "Error desconocido";
-      const isApiError = msg.includes("fetch") || msg.includes("token") || msg.includes("limit") || msg.includes("tiempo") || msg.includes("conexión") || msg.includes("bearer");
-      setError(isApiError
-        ? "⚠️ La IA no está disponible ahora. Usa el botón de modo manual ↓ para ingresar la cotización sin IA."
-        : "Error: " + msg
-      );
+      console.error("[Cotizador] Error IA:", e);
+      setError("⚠️ La IA no pudo generar la cotización. Detalle: " + msg + " — Puedes usar el modo manual ↓");
       setStep("input");
     }
   };
