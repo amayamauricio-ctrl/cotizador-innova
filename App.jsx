@@ -93,6 +93,26 @@ const compressImage = (file) => new Promise((res, rej) => {
   img.src = url;
 });
 
+// Lee el JSON que devuelve la IA de forma tolerante
+const parseAIJson = (resp) => {
+  const raw = resp.content?.map(b => b.text || "").join("") || "";
+  console.log("[Cotizador] stop_reason:", resp.stop_reason, "| respuesta IA:", raw);
+  const s = raw.replace(/```(?:json)?/gi, "");
+  const start = s.indexOf("{");
+  const end = s.lastIndexOf("}");
+  if (start < 0 || end <= start) {
+    if (resp.stop_reason === "max_tokens") throw new Error("La respuesta de la IA quedó incompleta. Intenta de nuevo o divide los archivos en dos cotizaciones.");
+    throw new Error("La IA no devolvió una cotización (no hay JSON en la respuesta). Intenta de nuevo.");
+  }
+  const candidate = s.slice(start, end + 1);
+  try { return JSON.parse(candidate); } catch (e1) {
+    try { return JSON.parse(candidate.replace(/,\s*([}\]])/g, "$1")); } catch (e2) {
+      if (resp.stop_reason === "max_tokens") throw new Error("La respuesta de la IA quedó incompleta (demasiados ítems). Intenta de nuevo o divide los archivos en dos cotizaciones.");
+      throw new Error("La IA respondió con un formato inválido (" + e2.message + "). Intenta de nuevo.");
+    }
+  }
+};
+
 // Extrae texto de archivos Word usando mammoth
 const extractWordText = async (file) => {
   try {
@@ -361,7 +381,7 @@ export default function InnovaV3() {
   };
 
   // ── Analyze ──
-  const fetchWithTimeout = async (url, options, timeoutMs = 180000) => {
+  const fetchWithTimeout = async (url, options, timeoutMs = 300000) => {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
@@ -413,17 +433,14 @@ export default function InnovaV3() {
           headers:{ "Content-Type":"application/json", "x-api-key": apiKey, "anthropic-version": "2023-06-01", "anthropic-dangerous-direct-browser-access": "true" },
           body: JSON.stringify({
             model:"claude-sonnet-5-5",
-            max_tokens:2000,
+            max_tokens:16000,
             system: PROMPTS.servicios,
             messages:[{ role:"user", content: preciosUser }]
           }),
         });
         const resp2 = await res2.json();
         if (resp2.error) throw new Error(`[${res2.status} ${resp2.error.type}] ${resp2.error.message}`);
-        const raw2 = resp2.content?.map(b => b.text||"").join("") || "";
-        const match2 = raw2.match(/\{[\s\S]*\}/);
-        if (!match2) throw new Error("La IA no retornó JSON válido. Intenta de nuevo.");
-        const parsed = JSON.parse(match2[0]);
+        const parsed = parseAIJson(resp2);
 
         parsed.alcance_secciones = alcanceSecciones;
         parsed.condiciones_proveedor = condicionesArr;
@@ -436,29 +453,11 @@ export default function InnovaV3() {
         const res = await fetchWithTimeout("https://api.anthropic.com/v1/messages", {
           method:"POST",
           headers:{ "Content-Type":"application/json", "x-api-key": apiKey, "anthropic-version": "2023-06-01", "anthropic-dangerous-direct-browser-access": "true" },
-          body: JSON.stringify({ model:"claude-sonnet-5-5", max_tokens:2000, system:PROMPTS[quoteType], messages }),
+          body: JSON.stringify({ model:"claude-sonnet-5-5", max_tokens:16000, system:PROMPTS[quoteType], messages }),
         });
         const resp = await res.json();
         if (resp.error) throw new Error(`[${res.status} ${resp.error.type}] ${resp.error.message}`);
-        const raw = resp.content?.map(b => b.text||"").join("") || "";
-        let jsonStr = raw;
-        const match = raw.match(/\{[\s\S]*/);
-        if (!match) throw new Error("La IA no retornó JSON válido. Intenta de nuevo.");
-        jsonStr = match[0];
-        if (!jsonStr.trimEnd().endsWith('}')) {
-          const lastBrace = jsonStr.lastIndexOf('}');
-          jsonStr = jsonStr.substring(0, lastBrace + 1);
-          let opens = 0;
-          for (const ch of jsonStr) { if (ch==='{' || ch==='[') opens++; else if (ch==='}' || ch===']') opens--; }
-          while (opens > 0) { jsonStr += '}'; opens--; }
-        }
-        let parsed;
-        try { parsed = JSON.parse(jsonStr); }
-        catch(pe) {
-          const safeMatch = raw.match(/\{[\s\S]*?"opciones"\s*:\s*\[[\s\S]*?\}\s*\]/);
-          if (safeMatch) { parsed = JSON.parse(safeMatch[0] + '}'); }
-          else throw new Error("No se pudo parsear la respuesta. Intenta de nuevo.");
-        }
+        const parsed = parseAIJson(resp);
         const applyTax = parsed.aplica_iva !== false;
         const applyFee = parsed.tipo !== "servicios";
         const presup = Number(presupuestoCliente) || 0;
