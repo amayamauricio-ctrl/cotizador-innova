@@ -241,7 +241,12 @@ const recalcOption = (opt, applyTax = true, applyFee = true, presupuesto = 0) =>
 
   // 5. Subtotal = ítems + servicio10
   const sub = subtotalItems + servicio10;
-  const fee = (applyTax && applyFee) ? Math.round(sub * 0.16 / 1000) * 1000 : 0;
+  // Ítems marcados "sin_fee" (ej. servicios directos para cliente nuevo) no llevan fee
+  const sinFeeTotal = opt.items.filter(i => i.sin_fee).reduce((s,i) => s+(Number(i.v_total)||0), 0);
+  const baseFee = Math.max(0, sub - sinFeeTotal);
+  opt.base_fee = baseFee;
+  opt.items_sin_fee = sinFeeTotal;
+  const fee = (applyTax && applyFee) ? Math.round(baseFee * 0.16 / 1000) * 1000 : 0;
   const conFee = sub + fee;
   const iva = applyTax ? Math.round(conFee * 0.19 / 1000) * 1000 : 0;
 
@@ -252,6 +257,13 @@ const recalcOption = (opt, applyTax = true, applyFee = true, presupuesto = 0) =>
   opt.subtotal_con_fee = conFee;
   opt.iva = iva;
   opt.total = conFee + iva;
+};
+
+// POP: subtotal = suma de precios cliente; sin fee ni IVA (mismo criterio que al generar)
+const recalcPopOption = (opt) => {
+  const sub = opt.items?.reduce((s, i) => s + (Number(i.v_total)||0), 0) || 0;
+  opt.subtotal = sub; opt.subtotal_items = sub;
+  opt.fee = 0; opt.subtotal_con_fee = sub; opt.iva = 0; opt.total = sub;
 };
 
 // ─── PROVIDER FILE ENTRY ──────────────────────────────────────────────────────
@@ -442,6 +454,8 @@ export default function InnovaV3() {
         if (resp2.error) throw new Error(`[${res2.status} ${resp2.error.type}] ${resp2.error.message}`);
         const parsed = parseAIJson(resp2);
 
+        parsed.tipo = "servicios";
+        parsed.applyFee = false;
         parsed.alcance_secciones = alcanceSecciones;
         parsed.condiciones_proveedor = condicionesArr;
         parsed.opciones?.forEach(o => recalcOption(o, true, false));
@@ -504,33 +518,60 @@ export default function InnovaV3() {
   };
 
   // ── Item editing ──
+  // Recalcula una opción respetando el tipo de cotización y el switch de fee
+  const recalcFor = (d, oi) => {
+    const opt = d.opciones[oi];
+    if (d.tipo === "pop") return recalcPopOption(opt);
+    const conFee = d.tipo === "servicios" ? !!d.applyFee : true;
+    recalcOption(opt, d.aplica_iva!==false, conFee, Number(d.presupuesto_cliente||0));
+  };
+
   const updateItem = (oi, ii, field, val) => {
     const d = JSON.parse(JSON.stringify(data));
     const item = d.opciones[oi].items[ii];
-    item[field] = ["concepto","descripcion","categoria"].includes(field) ? val : Number(val);
-    if (field === "cantidad" || field === "v_unitario") {
-      if (d.tipo === "pop") {
-        // En POP: v_unitario es el COSTO del proveedor, calcular precio con margen
-        const precioConMargen = applyPopMargin(item.v_unitario);
-        item.precio_cliente = precioConMargen; // precio final al cliente
-        item.v_total = item.cantidad * precioConMargen;
-      } else {
-        item.v_total = item.cantidad * item.v_unitario;
+    if (field === "sin_fee") {
+      item.sin_fee = !!val;
+    } else if (field === "precio_cliente") {
+      // POP: precio al cliente escrito a mano (reemplaza el margen automático)
+      item.precio_cliente = Number(val) || 0;
+      item.precio_manual = true;
+      item.v_total = (Number(item.cantidad)||0) * item.precio_cliente;
+    } else if (field === "reset_precio") {
+      item.precio_manual = false;
+      item.precio_cliente = applyPopMargin(item.v_unitario);
+      item.v_total = (Number(item.cantidad)||0) * item.precio_cliente;
+    } else {
+      item[field] = ["concepto","descripcion","categoria"].includes(field) ? val : Number(val);
+      if (field === "cantidad" || field === "v_unitario") {
+        if (d.tipo === "pop") {
+          // En POP: v_unitario es el COSTO del proveedor. Si el precio fue escrito a mano, se respeta.
+          if (!item.precio_manual) item.precio_cliente = applyPopMargin(item.v_unitario);
+          item.v_total = item.cantidad * (item.precio_cliente || 0);
+        } else {
+          item.v_total = item.cantidad * item.v_unitario;
+        }
       }
     }
-    recalcOption(d.opciones[oi], d.aplica_iva!==false, d.tipo!=="servicios", Number(d.presupuesto_cliente||0));
+    recalcFor(d, oi);
     setData(d);
   };
   const addItem = (oi) => {
     const d = JSON.parse(JSON.stringify(data));
     d.opciones[oi].items.push({ concepto:"", descripcion:"", cantidad:1, v_unitario:0, v_total:0 });
-    recalcOption(d.opciones[oi], d.aplica_iva!==false, d.tipo!=="servicios", Number(d.presupuesto_cliente||0));
+    recalcFor(d, oi);
     setData(d);
   };
   const removeItem = (oi, ii) => {
     const d = JSON.parse(JSON.stringify(data));
     d.opciones[oi].items.splice(ii,1);
-    recalcOption(d.opciones[oi], d.aplica_iva!==false, d.tipo!=="servicios", Number(d.presupuesto_cliente||0));
+    recalcFor(d, oi);
+    setData(d);
+  };
+  // Marca/desmarca fee en todos los ítems de una opción
+  const setFeeAll = (oi, conFee) => {
+    const d = JSON.parse(JSON.stringify(data));
+    d.opciones[oi].items.forEach(i => { i.sin_fee = !conFee; });
+    recalcFor(d, oi);
     setData(d);
   };
   const addOption = () => {
@@ -609,7 +650,7 @@ export default function InnovaV3() {
               ${opt.servicio10 > 0 ? `<tr><td>Servicio 10% (A&amp;B)</td><td>${COP(opt.servicio10)}</td></tr>` : ""}
               <tr style="border-top:2px solid #ddd"><td><strong>Subtotal</strong></td><td><strong>${COP(opt.subtotal)}</strong></td></tr>
               ${aTax && aFee ? `
-              <tr><td>Fee Administrativo (16%)</td><td>${COP(opt.fee)}</td></tr>
+              <tr><td>Fee Administrativo (16%${opt.items_sin_fee > 0 ? " sobre ítems aplicables" : ""})</td><td>${COP(opt.fee)}</td></tr>
               <tr><td>Subtotal antes de IVA</td><td>${COP(opt.subtotal_con_fee)}</td></tr>` : ""}
               ${aTax ? `<tr><td>IVA (19%)</td><td>${COP(opt.iva)}</td></tr>` : ""}
               <tr class="sum-total"><td><strong>TOTAL</strong></td><td><strong>${COP(opt.total)}</strong></td></tr>
@@ -672,7 +713,7 @@ export default function InnovaV3() {
     // Option pages
     const optPages = data.opciones?.map((opt, oi) => {
       if (data.tipo === "pop") return buildCatPage(opt, oi, T, today);
-      return buildEvtPage(opt, oi, T, today, applyTax, data.tipo !== "servicios");
+      return buildEvtPage(opt, oi, T, today, applyTax, applyFee);
     }).join("\n");
 
     const photosHTML = eventPhotos.length > 0 ? `
@@ -1261,7 +1302,7 @@ ${photosHTML}
     const toggleFee = () => {
       const d = JSON.parse(JSON.stringify(data));
       d.applyFee = !d.applyFee;
-      d.opciones.forEach(o => recalcOption(o, true, d.applyFee, Number(d.presupuesto_cliente||0)));
+      d.opciones.forEach(o => recalcOption(o, d.aplica_iva!==false, d.applyFee, Number(d.presupuesto_cliente||0)));
       setData(d);
     };
 
@@ -1392,11 +1433,12 @@ ${photosHTML}
                 <div style={{ marginBottom:"16px" }}>
                   <div style={{ background:"#fff8e1", border:"1px solid #f0c040", borderRadius:"7px", padding:"8px 12px", marginBottom:"12px", fontSize:"9pt", color:"#8a6000" }}>
                     💡 Ingresa el <strong>costo del proveedor</strong>. La app aplica el margen automáticamente:<br/>
-                    costo &lt; $25.000 → precio × 2 &nbsp;|&nbsp; costo ≥ $25.000 → precio + 25%
+                    costo &lt; $25.000 → precio × 2 &nbsp;|&nbsp; costo ≥ $25.000 → precio + 25%<br/>
+                    ✏️ Si quieres otro precio, escríbelo en <strong>Precio cliente</strong>; ese valor se respeta en la cotización final.
                   </div>
                   <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:"12px" }}>
                   {opt.items?.map((item,ii)=>{
-                    const precioCliente = item.precio_cliente || applyPopMargin(item.v_unitario);
+                    const precioCliente = item.precio_manual ? (Number(item.precio_cliente)||0) : (item.precio_cliente || applyPopMargin(item.v_unitario));
                     return (
                     <div key={ii} style={{ border:"1px solid #e8e8e8", borderRadius:"8px", overflow:"hidden" }}>
                       <div style={{ background:T.color, padding:"9px 13px", display:"flex", justifyContent:"space-between", alignItems:"center" }}>
@@ -1421,12 +1463,29 @@ ${photosHTML}
                               style={{ width:"100%", border:"1px solid #eee", borderRadius:"4px", padding:"4px 8px", fontSize:"10pt" }}/>
                           </div>
                         </div>
-                        {item.v_unitario > 0 && (
-                          <div style={{ marginTop:"8px", background:"#f0fbfd", borderRadius:"5px", padding:"6px 10px", display:"flex", justifyContent:"space-between", alignItems:"center" }}>
-                            <span style={{ fontSize:"8pt", color:"#666" }}>Precio cliente (con margen):</span>
-                            <span style={{ fontWeight:"700", color:T.color, fontSize:"11pt" }}>{COP(precioCliente)}</span>
+                        <div style={{ marginTop:"8px", background: item.precio_manual ? "#fff4e5" : "#f0fbfd", borderRadius:"5px", padding:"6px 10px" }}>
+                          <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", gap:"8px" }}>
+                            <span style={{ fontSize:"8pt", color:"#666" }}>
+                              Precio cliente {item.precio_manual ? "(manual)" : "(con margen)"}:
+                            </span>
+                            <input type="number" value={precioCliente || ""} onChange={e=>updateItem(oi,ii,"precio_cliente",e.target.value)}
+                              title="Escribe otro precio si quieres reemplazar el margen automático"
+                              style={{ width:"120px", border:"1px solid #cfe3ea", borderRadius:"4px", padding:"4px 8px", fontSize:"10.5pt", fontWeight:"700", color:T.color, textAlign:"right" }}/>
                           </div>
-                        )}
+                          <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginTop:"4px", fontSize:"7.5pt" }}>
+                            {item.v_unitario > 0 && precioCliente > 0 ? (
+                              <span style={{ color: (precioCliente - item.v_unitario) / precioCliente < 0.2 ? "#c0392b" : "#888" }}>
+                                Margen: {Math.round((precioCliente - item.v_unitario) / precioCliente * 100)}%
+                                {(precioCliente - item.v_unitario) / precioCliente < 0.2 ? " ⚠️ bajo" : ""}
+                              </span>
+                            ) : <span/>}
+                            {item.precio_manual && (
+                              <button onClick={()=>updateItem(oi,ii,"reset_precio")} style={{ background:"none", border:"none", color:T.color, cursor:"pointer", fontSize:"7.5pt", textDecoration:"underline", padding:0 }}>
+                                ↺ Volver al margen automático
+                              </button>
+                            )}
+                          </div>
+                        </div>
                         <div style={{ marginTop:"6px", textAlign:"right", fontWeight:"700", color:T.color, fontSize:"12pt" }}>
                           Total: {COP(item.v_total || item.cantidad * precioCliente)}
                         </div>
@@ -1445,6 +1504,7 @@ ${photosHTML}
                       <th style={{ color:"white", padding:"8px 10px", textAlign:"right", width:"80px", fontSize:"8.5pt" }}>Cant.</th>
                       <th style={{ color:"white", padding:"8px 10px", textAlign:"right", width:"140px", fontSize:"8.5pt" }}>V. Unitario</th>
                       <th style={{ color:"white", padding:"8px 10px", textAlign:"right", width:"130px", fontSize:"8.5pt" }}>V. Total</th>
+                      {applyTax && applyFee && <th style={{ color:"white", padding:"8px 6px", textAlign:"center", width:"50px", fontSize:"8.5pt" }} title="Desmarca los ítems que NO llevan fee">Fee</th>}
                       <th style={{ color:"white", padding:"8px", width:"30px" }}></th>
                     </tr>
                   </thead>
@@ -1476,6 +1536,12 @@ ${photosHTML}
                             style={{ width:"125px", border:"1px solid #ddd", borderRadius:"4px", textAlign:"right", padding:"5px 6px", fontSize:"10pt", fontFamily:"inherit" }}/>
                         </td>
                         <td style={{ padding:"7px 8px", textAlign:"right", fontWeight:"700", color:T.color, fontSize:"10.5pt" }}>{COP(item.v_total)}</td>
+                        {applyTax && applyFee && (
+                          <td style={{ padding:"7px 4px", textAlign:"center" }}>
+                            <input type="checkbox" checked={!item.sin_fee} onChange={e=>updateItem(oi,ii,"sin_fee",!e.target.checked)}
+                              title={item.sin_fee ? "Este ítem NO lleva fee" : "Este ítem lleva fee 16%"} style={{ width:"16px", height:"16px", cursor:"pointer" }}/>
+                          </td>
+                        )}
                         <td style={{ padding:"7px 4px", textAlign:"center" }}>
                           <button onClick={()=>removeItem(oi,ii)} style={{ background:"none", border:"none", color:"#ccc", cursor:"pointer", fontSize:"16pt" }}>×</button>
                         </td>
@@ -1488,6 +1554,14 @@ ${photosHTML}
               <button onClick={()=>addItem(oi)} style={{ background:"transparent", border:`1px dashed ${T.color}`, color:T.color, padding:"6px 14px", borderRadius:"6px", cursor:"pointer", fontSize:"9pt", marginBottom:"14px" }}>
                 + Agregar ítem
               </button>
+              {!isPOP && applyTax && applyFee && (
+                <span style={{ marginLeft:"10px", fontSize:"8.5pt", color:"#888" }}>
+                  Fee en ítems:&nbsp;
+                  <button onClick={()=>setFeeAll(oi,true)} style={{ background:"none", border:"none", color:T.color, cursor:"pointer", textDecoration:"underline", fontSize:"8.5pt" }}>marcar todos</button>
+                  &nbsp;·&nbsp;
+                  <button onClick={()=>setFeeAll(oi,false)} style={{ background:"none", border:"none", color:T.color, cursor:"pointer", textDecoration:"underline", fontSize:"8.5pt" }}>quitar a todos</button>
+                </span>
+              )}
 
               {/* Summary */}
               <div style={{ display:"flex", justifyContent:"flex-end" }}>
@@ -1496,8 +1570,9 @@ ${photosHTML}
                     <tr><td style={{ padding:"5px 10px", color:"#666" }}>Subtotal ítems</td><td style={{ padding:"5px 10px", textAlign:"right" }}>{COP(opt.subtotal_items ?? opt.subtotal)}</td></tr>
                     {(opt.servicio10 > 0) && <tr><td style={{ padding:"5px 10px", color:"#666" }}>Servicio 10% (A&amp;B)</td><td style={{ padding:"5px 10px", textAlign:"right" }}>{COP(opt.servicio10)}</td></tr>}
                     <tr style={{ borderTop:"2px solid #eee" }}><td style={{ padding:"6px 10px", color:"#333", fontWeight:"700" }}>Subtotal</td><td style={{ padding:"6px 10px", textAlign:"right", fontWeight:"700" }}>{COP(opt.subtotal)}</td></tr>
-                    {applyTax && applyFee && <>
-                      <tr><td style={{ padding:"5px 10px", color:"#666" }}>Fee 16%</td><td style={{ padding:"5px 10px", textAlign:"right" }}>{COP(opt.fee)}</td></tr>
+                    {applyTax && applyFee && !isPOP && <>
+                      {opt.items_sin_fee > 0 && <tr><td style={{ padding:"5px 10px", color:"#999", fontSize:"8.5pt" }}>Ítems sin fee</td><td style={{ padding:"5px 10px", textAlign:"right", color:"#999", fontSize:"8.5pt" }}>{COP(opt.items_sin_fee)}</td></tr>}
+                      <tr><td style={{ padding:"5px 10px", color:"#666" }}>Fee 16%{opt.items_sin_fee > 0 ? " (ítems aplicables)" : ""}</td><td style={{ padding:"5px 10px", textAlign:"right" }}>{COP(opt.fee)}</td></tr>
                       <tr><td style={{ padding:"5px 10px", color:"#666", borderBottom:"1px solid #eee" }}>Subtotal + Fee</td><td style={{ padding:"5px 10px", textAlign:"right", borderBottom:"1px solid #eee" }}>{COP(opt.subtotal_con_fee)}</td></tr>
                     </>}
                     {applyTax && <tr><td style={{ padding:"5px 10px", color:"#666" }}>IVA 19%</td><td style={{ padding:"5px 10px", textAlign:"right" }}>{COP(opt.iva)}</td></tr>}
