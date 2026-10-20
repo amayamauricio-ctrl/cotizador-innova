@@ -740,26 +740,40 @@ export default function InnovaV3() {
         ${pf(data)}
       </div>` : "";
 
-    // Option pages
-    const optPages = data.opciones?.map((opt, oi) => {
-      if (data.tipo === "pop") return buildCatPage(opt, oi, T, today);
-      return buildEvtPage(opt, oi, T, today, applyTax, applyFee);
-    }).join("\n");
-
-    const photosHTML = eventPhotos.length > 0 ? `
+    // Página(s) de fotos: máx. 6 por página
+    const buildPhotosPages = (titulo, fotos) => {
+      if (!fotos.length) return "";
+      const pages = [];
+      for (let k = 0; k < fotos.length; k += 6) pages.push(fotos.slice(k, k + 6));
+      return pages.map((grupo, gi) => `
       <div class="page">
         ${ph(today)}
-        <h2 class="section-title">Fotografías del Espacio</h2>
-        ${eventPhotos.length === 1
+        <h2 class="section-title">${titulo}${pages.length > 1 ? ` (${gi + 1}/${pages.length})` : ""}</h2>
+        ${grupo.length === 1
           ? `<div style="text-align:center;margin-top:16px">
-               <img src="${eventPhotos[0].url}" alt="Espacio" style="width:90%;max-height:400px;object-fit:cover;border-radius:10px;border:1px solid #e0f5f8;display:inline-block"/>
+               <img src="${grupo[0].url}" alt="Espacio" style="width:90%;max-height:400px;object-fit:cover;border-radius:10px;border:1px solid #e0f5f8;display:inline-block"/>
              </div>`
           : `<div class="photos-grid">
-               ${eventPhotos.slice(0,6).map(p => `<img src="${p.url}" class="event-photo" alt="Espacio"/>`).join("")}
+               ${grupo.map(p => `<img src="${p.url}" class="event-photo" alt="Espacio"/>`).join("")}
              </div>`
         }
         ${pf(data)}
-      </div>` : "";
+      </div>`).join("");
+    };
+    const nOpc = data.opciones?.length || 0;
+    const fotoOpcion = (p) => (Number.isInteger(p.opcion) && p.opcion < nOpc) ? p.opcion : null;
+
+    // Option pages (cada opción seguida de sus fotos)
+    const optPages = data.opciones?.map((opt, oi) => {
+      const page = data.tipo === "pop"
+        ? buildCatPage(opt, oi, T, today)
+        : buildEvtPage(opt, oi, T, today, applyTax, applyFee);
+      const fotos = eventPhotos.filter(p => fotoOpcion(p) === oi);
+      return page + buildPhotosPages(`Fotografías — ${opt.titulo || `Opción ${oi+1}`}`, fotos);
+    }).join("\n");
+
+    // Fotos sin opción asignada
+    const photosHTML = buildPhotosPages("Fotografías del Espacio", eventPhotos.filter(p => fotoOpcion(p) === null));
 
     return `<!DOCTYPE html>
 <html lang="es">
@@ -1673,6 +1687,32 @@ ${photosHTML}
               </div>
             </div>
           ))}
+
+          {/* Fotografías por opción */}
+          {eventPhotos.length > 0 && (
+            <div style={{ background:"white", borderRadius:"10px", padding:"18px 22px", marginBottom:"14px", boxShadow:"0 2px 8px rgba(0,0,0,.06)" }}>
+              <div style={{ fontWeight:"700", color:BRAND.azul, fontSize:"11pt", marginBottom:"4px" }}>📷 Fotografías por opción</div>
+              <div style={{ fontSize:"8.5pt", color:"#999", marginBottom:"12px" }}>
+                Asigna cada foto a su opción. En el PDF, las fotos aparecen justo después de los precios de esa opción. Las que queden en "General" van en una página aparte.
+              </div>
+              <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fill, minmax(150px, 1fr))", gap:"12px" }}>
+                {eventPhotos.map((p, i) => {
+                  const asignada = Number.isInteger(p.opcion) && p.opcion < (data.opciones?.length||0) ? String(p.opcion) : "";
+                  return (
+                    <div key={i} style={{ border:"1px solid #eee", borderRadius:"8px", overflow:"hidden" }}>
+                      <img src={p.url} alt="" style={{ width:"100%", height:"100px", objectFit:"cover", display:"block" }}/>
+                      <select value={asignada}
+                        onChange={e => { const v = e.target.value; setEventPhotos(prev => prev.map((x, j) => j === i ? { ...x, opcion: v === "" ? null : Number(v) } : x)); }}
+                        style={{ width:"100%", border:"none", borderTop:"1px solid #eee", padding:"6px 8px", fontSize:"9pt", fontFamily:"inherit", background: asignada === "" ? "#fafafa" : "#f0fbfd", cursor:"pointer" }}>
+                        <option value="">General</option>
+                        {data.opciones?.map((o, oi) => <option key={oi} value={String(oi)}>{o.titulo || `Opción ${oi+1}`}</option>)}
+                      </select>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
 
           {/* Botón agregar opción */}
           <button onClick={addOption} style={{ width:"100%", background:"transparent", border:`1px dashed ${T.color}`, color:T.color, padding:"10px", borderRadius:"8px", cursor:"pointer", fontSize:"10pt", fontWeight:"600", marginBottom:"12px" }}>
