@@ -182,6 +182,16 @@ RESPONDE SOLO JSON válido sin texto adicional:
 
 const PROMPTS = { evento: PROMPT_EVENTO, pop: PROMPT_POP, servicios: PROMPT_SERVICIOS };
 
+// Modo "sin margen": Innova gana solo con fee + servicios propios
+const SIN_MARGEN_RULES = `
+
+MODO SIN MARGEN (ESTA REGLA REEMPLAZA CUALQUIER REGLA DE MARGEN ANTERIOR):
+- NO apliques ningún margen sobre lo que cotiza el proveedor. En v_unitario pon EXACTAMENTE el precio del proveedor, y v_total = cantidad × v_unitario.
+- No conviertas cortesías en cobros: si el proveedor da algo en cortesía, inclúyelo con valor 0 o no lo incluyas.
+- Innova solo gana con el fee y con sus servicios propios (por ejemplo "Coordinación de Evento"), que sí se incluyen con su valor normal.
+- Nunca inventes valores.`;
+const getPrompt = (tipo, sinMargen) => PROMPTS[tipo] + (sinMargen && tipo !== "pop" ? SIN_MARGEN_RULES : "");
+
 // ─── RECALC ───────────────────────────────────────────────────────────────────
 // Helper: detectar si un ítem es de A&B
 const isABItem = (item) => {
@@ -266,6 +276,22 @@ const recalcPopOption = (opt) => {
   opt.fee = 0; opt.subtotal_con_fee = sub; opt.iva = 0; opt.total = sub;
 };
 
+// ─── CONDICIONES DE PAGO ─────────────────────────────────────────────────────
+const FORMAS_PAGO = {
+  anticipo: {
+    label: "50% anticipo / 50% antes del evento",
+    pago: `<strong>50% de anticipo</strong> al momento de aprobación mediante Orden de Servicio firmada. <strong>50% restante</strong> cinco (5) días hábiles antes del evento o entrega.`,
+    cancelacion: `Cancelaciones con menos de <strong>5 días hábiles</strong> de anticipación no generan devolución del anticipo.`,
+    aceptacion: `La aprobación se formaliza con la firma de la <strong>Orden de Servicio</strong> y el pago del anticipo.`,
+  },
+  credito30: {
+    label: "Factura a 30 días",
+    pago: `<strong>100% contra factura</strong>, con plazo de pago de <strong>treinta (30) días calendario</strong> contados a partir de la radicación de la factura.`,
+    cancelacion: `Se trasladan al cliente las <strong>políticas de cancelación de los proveedores</strong> involucrados en el servicio. En caso de cancelación, se cobrarán los valores que cada proveedor aplique según sus condiciones.`,
+    aceptacion: `La <strong>emisión de la Orden de Compra</strong> por parte del cliente se considera aceptación de la presente propuesta y de sus condiciones.`,
+  },
+};
+
 // ─── PROVIDER FILE ENTRY ──────────────────────────────────────────────────────
 const PROVIDER_CATEGORIES = ["Catering / Alimentos","Bebidas","Audiovisual / Tecnología","Venue / Salón","Logística / Transporte","Personal / Staff","Decoración","Entretenimiento","Material POP","PR / Medios","Marketing Digital","General / Sin categoría"];
 
@@ -302,6 +328,7 @@ export default function InnovaV3() {
   const [logoDataURL, setLogoDataURL] = useState(LOGO_DEFAULT);
   const [extraInfo, setExtraInfo]     = useState("");
   const [presupuestoCliente, setPresupuestoCliente] = useState("");
+  const [sinMargen, setSinMargen] = useState(false);
   const [alcanceTexto, setAlcanceTexto] = useState("");
   const [condicionesTexto, setCondicionesTexto] = useState("");
   const [apiKey, setApiKey] = useState(localStorage.getItem("innova_api_key") || "");
@@ -342,7 +369,7 @@ export default function InnovaV3() {
   // ── Build message content ──
   const buildContent = async (extra="") => {
     const blocks = [];
-    blocks.push({ type:"text", text:`Analiza la siguiente información y genera la cotización profesional de Innova Insight SAS.\n\nInformación del evento/cliente:\n${extraInfo}${extra ? `\n\nInformación complementaria:\n${extra}` : ""}${presupuestoCliente && Number(presupuestoCliente) > 0 ? `\n\nPRESUPUESTO DEL CLIENTE: ${Number(presupuestoCliente).toLocaleString("es-CO")} COP (SIN IVA).\nEste presupuesto equivale a SUBTOTAL + FEE 16%. Es decir: Subtotal objetivo = ${Math.round(Number(presupuestoCliente) / 1.16 / 1000) * 1000} COP (presupuesto / 1.16).\nEl Subtotal incluye todos los ítems más el Servicio 10% sobre A&B.\nAjusta los precios de venta para llegar exactamente a este objetivo. Margen mínimo 30%.` : ""}` });
+    blocks.push({ type:"text", text:`Analiza la siguiente información y genera la cotización profesional de Innova Insight SAS.\n\nInformación del evento/cliente:\n${extraInfo}${extra ? `\n\nInformación complementaria:\n${extra}` : ""}${sinMargen && quoteType !== "pop" ? "\n\nIMPORTANTE: cotización SIN MARGEN sobre proveedores (usa los precios del proveedor tal cual)." : ""}${!(sinMargen && quoteType !== "pop") && presupuestoCliente && Number(presupuestoCliente) > 0 ? `\n\nPRESUPUESTO DEL CLIENTE: ${Number(presupuestoCliente).toLocaleString("es-CO")} COP (SIN IVA).\nEste presupuesto equivale a SUBTOTAL + FEE 16%. Es decir: Subtotal objetivo = ${Math.round(Number(presupuestoCliente) / 1.16 / 1000) * 1000} COP (presupuesto / 1.16).\nEl Subtotal incluye todos los ítems más el Servicio 10% sobre A&B.\nAjusta los precios de venta para llegar exactamente a este objetivo. Margen mínimo 30%.` : ""}` });
 
     if (providerEntries.length > 0) {
       blocks.push({ type:"text", text:`\n--- ARCHIVOS DEL PROVEEDOR (${providerEntries.length} archivos) ---` });
@@ -446,7 +473,7 @@ export default function InnovaV3() {
           body: JSON.stringify({
             model:"claude-sonnet-5-5",
             max_tokens:16000,
-            system: PROMPTS.servicios,
+            system: getPrompt("servicios", sinMargen),
             messages:[{ role:"user", content: preciosUser }]
           }),
         });
@@ -455,10 +482,11 @@ export default function InnovaV3() {
         const parsed = parseAIJson(resp2);
 
         parsed.tipo = "servicios";
-        parsed.applyFee = false;
+        parsed.sin_margen = sinMargen;
+        parsed.applyFee = sinMargen; // sin margen, la ganancia viene del fee: se activa por defecto
         parsed.alcance_secciones = alcanceSecciones;
         parsed.condiciones_proveedor = condicionesArr;
-        parsed.opciones?.forEach(o => recalcOption(o, true, false));
+        parsed.opciones?.forEach(o => recalcOption(o, parsed.aplica_iva !== false, parsed.applyFee));
         setData(parsed);
         setStep("review");
 
@@ -467,15 +495,16 @@ export default function InnovaV3() {
         const res = await fetchWithTimeout("https://api.anthropic.com/v1/messages", {
           method:"POST",
           headers:{ "Content-Type":"application/json", "x-api-key": apiKey, "anthropic-version": "2023-06-01", "anthropic-dangerous-direct-browser-access": "true" },
-          body: JSON.stringify({ model:"claude-sonnet-5-5", max_tokens:16000, system:PROMPTS[quoteType], messages }),
+          body: JSON.stringify({ model:"claude-sonnet-5-5", max_tokens:16000, system:getPrompt(quoteType, sinMargen), messages }),
         });
         const resp = await res.json();
         if (resp.error) throw new Error(`[${res.status} ${resp.error.type}] ${resp.error.message}`);
         const parsed = parseAIJson(resp);
         const applyTax = parsed.aplica_iva !== false;
         const applyFee = parsed.tipo !== "servicios";
-        const presup = Number(presupuestoCliente) || 0;
+        const presup = (sinMargen && quoteType !== "pop") ? 0 : (Number(presupuestoCliente) || 0);
         parsed.presupuesto_cliente = presup;
+        parsed.sin_margen = sinMargen && quoteType !== "pop";
         // Para POP: aplicar márgenes sobre v_unitario (costo proveedor)
         if (parsed.tipo === "pop") {
           parsed.opciones?.forEach(o => {
@@ -598,6 +627,7 @@ export default function InnovaV3() {
     const T = TYPES[data.tipo] || TYPES.evento;
     const applyFee = data.tipo !== "servicios" ? true : (data.applyFee || false);
     const applyTax = data.aplica_iva !== false;
+    const FP = FORMAS_PAGO[data.forma_pago] || FORMAS_PAGO.anticipo;
     // Usar versión oscura del logo en portada, clara en encabezados
     const logoCover = logoDataURL === LOGO_DEFAULT ? LOGO_DARK : logoDataURL;
     const logoHeader = logoDataURL;
@@ -907,12 +937,15 @@ ${photosHTML}
         <div class="cond-item">
           <h4>${c.titulo}</h4>
           <p style="white-space:pre-line">${c.contenido}</p>
-        </div>`).join("")
+        </div>`).join("") + (data.forma_pago === "credito30" ? `
+        <div class="cond-item"><h4>Forma de Pago</h4><p>${FP.pago}</p></div>
+        <div class="cond-item"><h4>Política de Cancelación</h4><p>${FP.cancelacion}</p>${data.politica_cancelacion_prov?.trim() ? `<p style="white-space:pre-line;margin-top:6px">${data.politica_cancelacion_prov.trim().replace(/</g,"&lt;")}</p>` : ""}</div>
+        <div class="cond-item"><h4>Aceptación</h4><p>${FP.aceptacion}</p></div>` : "")
     : `<div class="cond-item"><h4>Validez</h4><p>Esta propuesta tiene vigencia de <strong>5 días hábiles</strong> desde su emisión.</p></div>
        <div class="cond-item"><h4>Moneda</h4><p>Todos los valores están expresados en <strong>Pesos Colombianos (COP)</strong>${applyTax ? ", incluyen IVA del 19% según la normativa tributaria colombiana vigente" : ""}.</p></div>
-       <div class="cond-item"><h4>Forma de Pago</h4><p><strong>50% de anticipo</strong> al momento de aprobación mediante Orden de Servicio firmada. <strong>50% restante</strong> cinco (5) días hábiles antes del evento o entrega.</p></div>
-       <div class="cond-item"><h4>Política de Cancelación</h4><p>Cancelaciones con menos de <strong>5 días hábiles</strong> de anticipación no generan devolución del anticipo.</p></div>
-       <div class="cond-item"><h4>Aceptación</h4><p>La aprobación se formaliza con la firma de la <strong>Orden de Servicio</strong> y el pago del anticipo.</p></div>`
+       <div class="cond-item"><h4>Forma de Pago</h4><p>${FP.pago}</p></div>
+       <div class="cond-item"><h4>Política de Cancelación</h4><p>${FP.cancelacion}</p>${data.forma_pago === "credito30" && data.politica_cancelacion_prov?.trim() ? `<p style="white-space:pre-line;margin-top:6px">${data.politica_cancelacion_prov.trim().replace(/</g,"&lt;")}</p>` : ""}</div>
+       <div class="cond-item"><h4>Aceptación</h4><p>${FP.aceptacion}</p></div>`
   }
   <div class="sign-row">
     <div class="sign-box">Firma y sello del cliente</div>
@@ -1196,8 +1229,31 @@ ${photosHTML}
             style={{ width:"100%", height:"120px", background:"rgba(255,255,255,.06)", border:"1px solid rgba(255,255,255,.14)", borderRadius:"10px", padding:"13px", color:"white", fontSize:"10pt", fontFamily:"inherit", resize:"vertical", outline:"none" }}/>
         </div>
 
-        {/* Presupuesto del cliente */}
+        {/* Margen sobre proveedor */}
         {quoteType !== "pop" && (
+          <div style={{ marginBottom:"18px", background:"rgba(255,255,255,.06)", border:"1px solid rgba(255,255,255,.14)", borderRadius:"10px", padding:"14px 16px" }}>
+            <div style={{ color:"#f0a500", fontSize:"8pt", textTransform:"uppercase", letterSpacing:"2px", marginBottom:"10px" }}>📊 Margen sobre el proveedor</div>
+            <div style={{ display:"flex", gap:"10px", flexWrap:"wrap" }}>
+              {[
+                [false, "Con margen", quoteType==="evento" ? "La IA aplica el margen sobre los precios del proveedor (como siempre)." : "La IA aplica el margen de servicios sobre el costo del proveedor."],
+                [true, "Sin margen (solo fee + servicios propios)", "Precios del proveedor tal cual. Innova gana con el fee 16% y sus servicios propios (ej. Coordinación)."],
+              ].map(([val, label, desc]) => {
+                const activo = sinMargen === val;
+                return (
+                  <button key={String(val)} onClick={()=>setSinMargen(val)}
+                    style={{ flex:"1 1 220px", textAlign:"left", padding:"10px 14px", borderRadius:"8px", cursor:"pointer", fontFamily:"inherit",
+                      background: activo ? "rgba(240,165,0,.15)" : "transparent", border: activo ? "2px solid #f0a500" : "1px solid rgba(255,255,255,.2)" }}>
+                    <div style={{ color: activo ? "#f0a500" : "white", fontWeight:"700", fontSize:"10pt" }}>{activo ? "● " : "○ "}{label}</div>
+                    <div style={{ color:"rgba(255,255,255,.6)", fontSize:"8.5pt", marginTop:"4px", lineHeight:"1.4" }}>{desc}</div>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        )}
+
+        {/* Presupuesto del cliente */}
+        {quoteType !== "pop" && !sinMargen && (
           <div style={{ marginBottom:"18px", background:"rgba(255,255,255,.06)", border:"1px solid rgba(255,255,255,.14)", borderRadius:"10px", padding:"14px 16px" }}>
             <div style={{ color:"#f0a500", fontSize:"8pt", textTransform:"uppercase", letterSpacing:"2px", marginBottom:"8px" }}>💰 Presupuesto del cliente (opcional)</div>
             <div style={{ display:"flex", alignItems:"center", gap:"12px" }}>
@@ -1322,6 +1378,7 @@ ${photosHTML}
           <div>
             <span style={{ fontFamily:"Georgia,serif", fontWeight:"900", fontSize:"14pt", color:"white" }}>INNOVA <span style={{ color:"#f0a500" }}>INSIGHT</span></span>
             <span style={{ marginLeft:"14px", color:"#7aaed4", fontSize:"9pt" }}>{T.icon} {T.label} · Revisión</span>
+            {data.sin_margen && <span style={{ marginLeft:"10px", background:"#f0a500", color:"#0d1f35", fontSize:"8pt", fontWeight:"700", padding:"2px 8px", borderRadius:"10px" }}>SIN MARGEN · solo fee + servicios propios</span>}
           </div>
           <div style={{ display:"flex", gap:"10px" }}>
             <button onClick={()=>setStep("input")} style={{ background:"transparent", border:"1px solid rgba(255,255,255,.2)", color:"#aac4e0", padding:"7px 14px", borderRadius:"6px", cursor:"pointer", fontSize:"9pt" }}>← Nueva</button>
@@ -1350,6 +1407,37 @@ ${photosHTML}
               <span style={{ fontSize:"10pt", color:"#555" }}>✉️ comercial@novainsight.club</span>
               <span style={{ fontSize:"10pt", color:"#555" }}>📞 3028390022</span>
             </div>
+          </div>
+
+          {/* Condiciones de pago */}
+          <div style={{ background:"white", borderRadius:"10px", padding:"16px 22px", marginBottom:"14px", boxShadow:"0 2px 8px rgba(0,0,0,.06)" }}>
+            <div style={{ fontWeight:"700", color:BRAND.azul, fontSize:"11pt", marginBottom:"10px" }}>💳 Condiciones de pago</div>
+            <div style={{ display:"flex", gap:"10px", flexWrap:"wrap" }}>
+              {Object.entries(FORMAS_PAGO).map(([key, fp]) => {
+                const activo = (data.forma_pago || "anticipo") === key;
+                return (
+                  <button key={key} onClick={()=>setData({ ...data, forma_pago:key })}
+                    style={{ flex:"1 1 220px", textAlign:"left", padding:"10px 14px", borderRadius:"8px", cursor:"pointer", fontFamily:"inherit",
+                      border: activo ? `2px solid ${BRAND.azul}` : "1px solid #ddd", background: activo ? "#f0fbfd" : "white" }}>
+                    <div style={{ fontWeight:"700", fontSize:"10pt", color: activo ? BRAND.azul : "#555" }}>{activo ? "● " : "○ "}{fp.label}</div>
+                    <div style={{ fontSize:"8.5pt", color:"#888", marginTop:"4px" }} dangerouslySetInnerHTML={{ __html: fp.pago }}/>
+                  </button>
+                );
+              })}
+            </div>
+            {data.forma_pago === "credito30" && (
+              <div style={{ marginTop:"12px" }}>
+                <div style={{ fontSize:"8.5pt", color:"#666", marginBottom:"4px" }}>
+                  Políticas de cancelación del proveedor <span style={{ color:"#aaa" }}>(opcional — se trasladan al cliente y aparecen en el PDF)</span>
+                </div>
+                <textarea value={data.politica_cancelacion_prov || ""} onChange={e=>setData({ ...data, politica_cancelacion_prov:e.target.value })}
+                  placeholder={"Ej: Cancelación con más de 15 días: sin costo.\nEntre 8 y 15 días: 50% del valor.\nMenos de 7 días: 100% del valor."}
+                  style={{ width:"100%", minHeight:"70px", border:"1px solid #ddd", borderRadius:"6px", padding:"8px 10px", fontSize:"9.5pt", fontFamily:"inherit", resize:"vertical" }}/>
+              </div>
+            )}
+            {isServicios && data.condiciones_proveedor?.length > 0 && (data.forma_pago || "anticipo") === "anticipo" && (
+              <div style={{ fontSize:"8pt", color:"#999", marginTop:"8px" }}>En servicios con condiciones del proveedor pegadas, se usan esas condiciones tal cual.</div>
+            )}
           </div>
 
           {/* Fee toggle — solo servicios */}
