@@ -1,4 +1,4 @@
-import React, { useState, useRef, useCallback } from "react";
+import React, { useState, useRef, useCallback, useEffect } from "react";
 import * as mammoth from "mammoth";
 
 
@@ -112,6 +112,37 @@ const parseAIJson = (resp) => {
     }
   }
 };
+
+// ─── HISTORIAL: últimas 5 cotizaciones (IndexedDB de este navegador) ─────────
+const HIST_DB = "innova_cotizador", HIST_STORE = "cotizaciones", HIST_MAX = 5;
+const histOpen = () => new Promise((res, rej) => {
+  const r = indexedDB.open(HIST_DB, 1);
+  r.onupgradeneeded = () => r.result.createObjectStore(HIST_STORE, { keyPath: "id" });
+  r.onsuccess = () => res(r.result);
+  r.onerror = () => rej(r.error);
+});
+const histTx = async (mode, fn) => {
+  const db = await histOpen();
+  return new Promise((res, rej) => {
+    const tx = db.transaction(HIST_STORE, mode);
+    const out = fn(tx.objectStore(HIST_STORE));
+    tx.oncomplete = () => res(out?.result ?? out);
+    tx.onerror = () => rej(tx.error);
+  });
+};
+const histList = async () => {
+  try {
+    const all = await histTx("readonly", st => st.getAll());
+    return (all || []).sort((a, b) => b.fecha - a.fecha);
+  } catch (e) { console.error("[Cotizador] historial", e); return []; }
+};
+const histSave = async (entry) => {
+  await histTx("readwrite", st => st.put(entry));
+  const all = await histList();
+  const sobrantes = all.slice(HIST_MAX);
+  if (sobrantes.length) await histTx("readwrite", st => sobrantes.forEach(x => st.delete(x.id)));
+};
+const histDelete = (id) => histTx("readwrite", st => st.delete(id));
 
 // Extrae texto de archivos Word usando mammoth
 const extractWordText = async (file) => {
@@ -338,6 +369,10 @@ export default function InnovaV3() {
   const [quoteType, setQuoteType]     = useState("evento");
   const [providerEntries, setProviderEntries] = useState([]); // [{file, category, venue}]
   const [eventPhotos, setEventPhotos] = useState([]);         // [{file, url}]
+  const [historial, setHistorial] = useState([]);             // últimas 5 cotizaciones
+  const [currentQuoteId, setCurrentQuoteId] = useState(null); // id si se está editando una guardada
+  const [histMsg, setHistMsg] = useState("");
+  useEffect(() => { histList().then(setHistorial); }, []);
   const [logoDataURL, setLogoDataURL] = useState(LOGO_DEFAULT);
   const [extraInfo, setExtraInfo]     = useState("");
   const [presupuestoCliente, setPresupuestoCliente] = useState("");
@@ -500,6 +535,7 @@ export default function InnovaV3() {
         parsed.alcance_secciones = alcanceSecciones;
         parsed.condiciones_proveedor = condicionesArr;
         parsed.opciones?.forEach(o => recalcOption(o, parsed.aplica_iva !== false, parsed.applyFee));
+        setCurrentQuoteId(null);
         setData(parsed);
         setStep("review");
 
@@ -533,6 +569,7 @@ export default function InnovaV3() {
         } else {
           parsed.opciones?.forEach(o => recalcOption(o, applyTax, applyFee, presup));
         }
+        setCurrentQuoteId(null);
         setData(parsed);
         setStep("review");
       }
@@ -622,6 +659,21 @@ export default function InnovaV3() {
     setData(d);
   };
 
+  const abrirDelHistorial = (entry) => {
+    setData(JSON.parse(JSON.stringify(entry.data)));
+    setEventPhotos((entry.photos || []).map(p => ({ file: null, url: p.url, opcion: p.opcion })));
+    setQuoteType(entry.tipo || "evento");
+    setCurrentQuoteId(entry.id);
+    setError(""); setDownloadUrl(""); setHtmlContent("");
+    setStep("review");
+  };
+  const eliminarDelHistorial = async (id) => {
+    if (!window.confirm("¿Eliminar esta cotización del historial?")) return;
+    await histDelete(id);
+    if (currentQuoteId === id) setCurrentQuoteId(null);
+    setHistorial(await histList());
+  };
+
   // ─── GENERATE HTML ────────────────────────────────────────────────────────
   const generatePDF = () => {
     setStep("generating");
@@ -630,6 +682,21 @@ export default function InnovaV3() {
       setHtmlContent(html);
       setDownloadUrl(URL.createObjectURL(new Blob([html], { type:"text/html;charset=utf-8" })));
       setStep("done");
+      // Guardar en historial (si se editó una existente, se actualiza la misma)
+      const id = currentQuoteId || `q_${Date.now()}`;
+      const totales = (data.opciones || []).map(o => o.total || 0);
+      const entry = {
+        id, fecha: Date.now(), tipo: data.tipo,
+        cliente: data.cliente || "Sin cliente",
+        titulo: data.evento || data.campana || data.proyecto || "",
+        opciones: data.opciones?.length || 0,
+        total: totales.length ? Math.max(...totales) : 0,
+        data: JSON.parse(JSON.stringify(data)),
+        photos: eventPhotos.map(p => ({ url: p.url, opcion: Number.isInteger(p.opcion) ? p.opcion : null })),
+      };
+      setCurrentQuoteId(id);
+      histSave(entry).then(() => histList().then(setHistorial))
+        .catch(err => { console.error("[Cotizador] no se pudo guardar en historial", err); setHistMsg("No se pudo guardar en el historial (¿navegador en modo incógnito?)."); });
     } catch(e) { setError("Error: "+e.message); setStep("review"); }
   };
 
@@ -1112,6 +1179,33 @@ ${photosHTML}
 
       <div style={{ maxWidth:"800px", margin:"0 auto", padding:"28px 20px 60px" }}>
 
+        {/* Historial — últimas 5 cotizaciones */}
+        {historial.length > 0 && (
+          <div style={{ background:"rgba(255,255,255,.06)", border:"1px solid rgba(255,255,255,.12)", borderRadius:"10px", padding:"14px 18px", marginBottom:"18px" }}>
+            <div style={{ color:"#f0a500", fontSize:"8pt", textTransform:"uppercase", letterSpacing:"2px", marginBottom:"10px" }}>
+              🕘 Últimas cotizaciones <span style={{ color:"#7aaed4", textTransform:"none", letterSpacing:0 }}>(se guardan las 5 más recientes en este navegador)</span>
+            </div>
+            {historial.map(h => (
+              <div key={h.id} style={{ display:"flex", alignItems:"center", gap:"12px", padding:"8px 0", borderTop:"1px solid rgba(255,255,255,.08)" }}>
+                <span style={{ fontSize:"15pt" }}>{TYPES[h.tipo]?.icon || "📄"}</span>
+                <div style={{ flex:1, minWidth:0 }}>
+                  <div style={{ color:"white", fontSize:"10pt", fontWeight:"700", whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis" }}>
+                    {h.cliente}{h.titulo ? ` — ${h.titulo}` : ""}
+                  </div>
+                  <div style={{ color:"#7aaed4", fontSize:"8.5pt" }}>
+                    {TYPES[h.tipo]?.label || h.tipo} · {new Date(h.fecha).toLocaleString("es-CO", { day:"numeric", month:"short", hour:"2-digit", minute:"2-digit" })}
+                    {h.opciones ? ` · ${h.opciones} opción${h.opciones > 1 ? "es" : ""}` : ""}
+                    {h.tipo !== "pop" && h.total ? ` · ${COP(h.total)}` : ""}
+                  </div>
+                </div>
+                <button onClick={()=>abrirDelHistorial(h)} style={{ background:"#f0a500", color:"#0d1f35", border:"none", padding:"6px 14px", borderRadius:"6px", cursor:"pointer", fontSize:"9pt", fontWeight:"700" }}>✏️ Abrir y editar</button>
+                <button onClick={()=>eliminarDelHistorial(h.id)} title="Eliminar del historial" style={{ background:"transparent", border:"none", color:"rgba(255,255,255,.4)", cursor:"pointer", fontSize:"13pt" }}>×</button>
+              </div>
+            ))}
+            {histMsg && <div style={{ color:"#ff7675", fontSize:"8.5pt", marginTop:"6px" }}>{histMsg}</div>}
+          </div>
+        )}
+
         {/* Logo */}
         <div style={{ background:"rgba(255,255,255,.06)", border:"1px solid rgba(255,255,255,.1)", borderRadius:"10px", padding:"18px 22px", marginBottom:"18px", display:"flex", alignItems:"center", gap:"20px" }}>
           {logoDataURL
@@ -1340,6 +1434,7 @@ ${photosHTML}
               opciones: [{ titulo:"Opción 1", venue:"", proveedores_incluidos:[], items:[], subtotal:0, fee:0, subtotal_con_fee:0, iva:0, total:0 }],
               aplica_iva: true,
             };
+            setCurrentQuoteId(null);
             setData(baseData);
             setStep("review");
           }}
@@ -1407,6 +1502,7 @@ ${photosHTML}
           <div>
             <span style={{ fontFamily:"Georgia,serif", fontWeight:"900", fontSize:"14pt", color:"white" }}>INNOVA <span style={{ color:"#f0a500" }}>INSIGHT</span></span>
             <span style={{ marginLeft:"14px", color:"#7aaed4", fontSize:"9pt" }}>{T.icon} {T.label} · Revisión</span>
+            {currentQuoteId && <span style={{ marginLeft:"10px", background:"rgba(255,255,255,.12)", color:"#aac4e0", fontSize:"8pt", padding:"2px 8px", borderRadius:"10px" }}>✏️ Editando cotización guardada — al generar se actualiza</span>}
             {data.sin_margen && <span style={{ marginLeft:"10px", background:"#f0a500", color:"#0d1f35", fontSize:"8pt", fontWeight:"700", padding:"2px 8px", borderRadius:"10px" }}>SIN MARGEN · solo fee + servicios propios</span>}
           </div>
           <div style={{ display:"flex", gap:"10px" }}>
@@ -1801,7 +1897,7 @@ ${photosHTML}
             style={{ background:"#f0a500", color:"#0d1f35", border:"none", padding:"7px 14px", borderRadius:"6px", cursor:"pointer", fontSize:"9pt", fontWeight:"700" }}>
             ⬇️ Descargar
           </button>
-          <button onClick={()=>{ setStep("input"); setProviderEntries([]); setEventPhotos([]); setData(null); setDownloadUrl(""); setHtmlContent(""); setExtraInfo(""); setPresupuestoCliente(""); setAlcanceTexto(""); setCondicionesTexto(""); }}
+          <button onClick={()=>{ setStep("input"); setCurrentQuoteId(null); setProviderEntries([]); setEventPhotos([]); setData(null); setDownloadUrl(""); setHtmlContent(""); setExtraInfo(""); setPresupuestoCliente(""); setAlcanceTexto(""); setCondicionesTexto(""); }}
             style={{ background:"transparent", border:"1px solid rgba(255,255,255,.3)", color:"white", padding:"7px 14px", borderRadius:"6px", cursor:"pointer", fontSize:"9pt" }}>Nueva</button>
         </div>
       </div>
