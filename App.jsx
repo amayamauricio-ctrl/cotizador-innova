@@ -95,6 +95,72 @@ const renderPdfPages = async (file, maxPages = 40, targetWidth = 1100) => {
   return out;
 };
 
+// Extrae las FOTOS ORIGINALES incrustadas en el PDF (sin los logos/textos que van encima)
+const extractPdfPhotos = async (file, maxPages = 40, minW = 300, minH = 200) => {
+  const pdfjs = await loadPdfJs();
+  const pdf = await pdfjs.getDocument({ data: await toArrayBuffer(file) }).promise;
+  const out = [];
+  const vistos = new Set();
+  for (let p = 1; p <= Math.min(pdf.numPages, maxPages); p++) {
+    const page = await pdf.getPage(p);
+    const ops = await page.getOperatorList();
+    for (let i = 0; i < ops.fnArray.length; i++) {
+      if (ops.fnArray[i] !== pdfjs.OPS.paintImageXObject) continue;
+      const name = ops.argsArray[i][0];
+      if (vistos.has(name)) continue;
+      vistos.add(name);
+      try {
+        const store = String(name).startsWith("g_") ? page.commonObjs : page.objs;
+        const img = await new Promise((res) => store.get(name, res));
+        if (!img || img.width < minW || img.height < minH) continue; // descarta logos e íconos
+        const scale = Math.min(1, 1600 / Math.max(img.width, img.height));
+        const c = document.createElement("canvas");
+        c.width = Math.round(img.width * scale); c.height = Math.round(img.height * scale);
+        const ctx = c.getContext("2d");
+        if (img.bitmap) {
+          ctx.drawImage(img.bitmap, 0, 0, c.width, c.height);
+        } else if (img.data) {
+          const full = document.createElement("canvas");
+          full.width = img.width; full.height = img.height;
+          const id = full.getContext("2d").createImageData(img.width, img.height);
+          const src = img.data, dst = id.data, n = img.width * img.height;
+          if (src.length === n * 4) dst.set(src);
+          else if (src.length === n * 3) { for (let k = 0; k < n; k++) { dst[k*4] = src[k*3]; dst[k*4+1] = src[k*3+1]; dst[k*4+2] = src[k*3+2]; dst[k*4+3] = 255; } }
+          else continue;
+          full.getContext("2d").putImageData(id, 0, 0);
+          ctx.drawImage(full, 0, 0, c.width, c.height);
+        } else continue;
+        out.push({ url: c.toDataURL("image/jpeg", 0.85), pagina: p });
+      } catch (e) { console.warn("[Cotizador] imagen no extraída", name, e); }
+    }
+  }
+  return out;
+};
+
+// Difumina una zona (para tapar un logo pegado en la foto)
+const blurZoneDataURL = (url, r) => new Promise((res, rej) => {
+  const img = new Image();
+  img.onload = () => {
+    const W = img.naturalWidth, H = img.naturalHeight;
+    const c = document.createElement("canvas");
+    c.width = W; c.height = H;
+    const ctx = c.getContext("2d");
+    ctx.drawImage(img, 0, 0);
+    const sx = r.x * W, sy = r.y * H, sw = r.w * W, sh = r.h * H;
+    const radius = Math.max(12, Math.max(sw, sh) / 3);
+    for (let pass = 0; pass < 3; pass++) {
+      ctx.save();
+      ctx.beginPath(); ctx.rect(sx, sy, sw, sh); ctx.clip();
+      ctx.filter = `blur(${radius}px)`;
+      ctx.drawImage(c, 0, 0);
+      ctx.restore();
+    }
+    res(c.toDataURL("image/jpeg", 0.88));
+  };
+  img.onerror = rej;
+  img.src = url;
+});
+
 // Recorta una imagen (dataURL) a un rectángulo en coordenadas relativas 0..1
 const cropDataURL = (url, r) => new Promise((res, rej) => {
   const img = new Image();
@@ -432,6 +498,8 @@ export default function InnovaV3() {
   const [pickerFor, setPickerFor] = useState(null);   // {ci, ii}
   const [cropIdx, setCropIdx] = useState(null);       // índice de imagen a recortar
   const [cropRect, setCropRect] = useState(null);     // {x,y,w,h} relativos 0..1
+  const [cropMode, setCropMode] = useState("recortar"); // "recortar" | "tapar"
+  const ownPhotoRef = useRef(null);
   const cropStart = useRef(null);
   const cropBox = useRef(null);
   useEffect(() => { histList().then(setHistorial); }, []);
@@ -566,6 +634,9 @@ export default function InnovaV3() {
           const f = entry.file;
           try {
             if (isPDF(f)) {
+              try {
+                (await extractPdfPhotos(f)).forEach(ph => imagenes.push({ url: ph.url, archivo: f.name, pagina: ph.pagina, foto: true }));
+              } catch (err) { console.warn("[Cotizador] no se pudieron extraer fotos originales", err); }
               (await renderPdfPages(f)).forEach((url, k) => imagenes.push({ url, archivo: f.name, pagina: k + 1 }));
             } else if (isImage(f)) {
               const url = f.size > MAX_IMAGE_BYTES ? "data:image/jpeg;base64," + await compressImage(f) : await toDataURL(f);
@@ -1667,6 +1738,20 @@ ${photosHTML}
       else if (field === "precio_proveedor") { it.precio_proveedor = Number(val) || 0; }
       else it[field] = val;
     });
+    const subirFotoPropia = async (e) => {
+      const files = [...(e.target.files || [])].filter(f => f.type.startsWith("image/"));
+      if (!files.length) return;
+      const urls = [];
+      for (const f of files) urls.push(f.size > MAX_IMAGE_BYTES ? "data:image/jpeg;base64," + await compressImage(f) : await toDataURL(f));
+      const t = pickerFor;
+      upd(d => {
+        d.imagenes = d.imagenes || [];
+        urls.forEach(u => d.imagenes.push({ url: u, archivo: "Foto propia", pagina: 0, recorte: true, propia: true }));
+        if (t) d.categorias[t.ci].items[t.ii].imagen = d.imagenes.length - urls.length;
+      });
+      e.target.value = "";
+      setPickerFor(null);
+    };
     const asignarImagen = (idx) => { const t = pickerFor; upd(d => { d.categorias[t.ci].items[t.ii].imagen = idx; }); setPickerFor(null); };
     const relPos = (e) => {
       const r = cropBox.current.getBoundingClientRect();
@@ -1680,12 +1765,12 @@ ${photosHTML}
     };
     const onCropUp = () => { cropStart.current = null; };
     const usarRecorte = async () => {
-      if (!cropRect || cropRect.w < 0.02 || cropRect.h < 0.02) { alert("Arrastra sobre la imagen para marcar el área a recortar."); return; }
-      const url = await cropDataURL(imgs[cropIdx].url, cropRect);
+      if (!cropRect || cropRect.w < 0.01 || cropRect.h < 0.01) { alert(cropMode === "tapar" ? "Arrastra sobre el logo para marcar la zona a tapar." : "Arrastra sobre la imagen para marcar el área a recortar."); return; }
+      const url = cropMode === "tapar" ? await blurZoneDataURL(imgs[cropIdx].url, cropRect) : await cropDataURL(imgs[cropIdx].url, cropRect);
       const src = imgs[cropIdx];
       const t = pickerFor;
       upd(d => {
-        d.imagenes.push({ url, archivo: src.archivo, pagina: src.pagina, recorte: true });
+        d.imagenes.push({ url, archivo: src.archivo, pagina: src.pagina, recorte: true, editada: cropMode === "tapar" });
         if (t) d.categorias[t.ci].items[t.ii].imagen = d.imagenes.length - 1;
       });
       setCropIdx(null); setCropRect(null); setPickerFor(null);
@@ -1710,7 +1795,7 @@ ${photosHTML}
 
         <div style={{ maxWidth:"980px", margin:"24px auto", padding:"0 16px" }}>
           <div style={{ background:"#fff8e1", border:"1px solid #f0c040", borderRadius:"8px", padding:"10px 14px", marginBottom:"14px", fontSize:"9pt", color:"#8a6000" }}>
-            🔒 La IA quitó el nombre y los datos del proveedor de los textos. <strong>Revisa las imágenes</strong>: las páginas del PDF pueden traer su logo o contacto — usa <strong>✂️ Recortar</strong> para dejar solo la foto.
+            🔒 La IA quitó el nombre y los datos del proveedor de los textos. Para las imágenes usa las <strong>📷 fotos originales</strong> (salen limpias del PDF); si alguna trae el logo pegado, usa <strong>🩹 Tapar logo</strong>, o sube tus propias fotos.
           </div>
 
           <div style={card}>
@@ -1758,7 +1843,7 @@ ${photosHTML}
                     <div key={ii} style={{ border:"1px solid #e8e8e8", borderRadius:"8px", overflow:"hidden" }}>
                       <div onClick={()=>setPickerFor({ ci, ii })} style={{ height:"130px", background: img ? `center/cover no-repeat url(${img.url})` : "#f3f6f7", cursor:"pointer", display:"flex", alignItems:"flex-end", justifyContent:"flex-end", padding:"6px" }}>
                         <span style={{ background:"rgba(13,31,53,.75)", color:"white", fontSize:"8pt", padding:"3px 8px", borderRadius:"10px" }}>
-                          {img ? (img.recorte ? "🖼️ Cambiar imagen" : "⚠️ Página completa — recortar") : "📷 Elegir imagen"}
+                          {img ? ((img.recorte || img.foto) ? "🖼️ Cambiar imagen" : "⚠️ Página completa — recortar") : "📷 Elegir imagen"}
                         </span>
                       </div>
                       <div style={{ padding:"10px 12px", display:"flex", flexDirection:"column", gap:"6px" }}>
@@ -1807,20 +1892,27 @@ ${photosHTML}
                 <button onClick={()=>setPickerFor(null)} style={{ background:"none", border:"none", fontSize:"16pt", cursor:"pointer", color:"#999" }}>×</button>
               </div>
               <div style={{ fontSize:"8.5pt", color:"#888", marginBottom:"12px" }}>
-                Usa <strong>✂️ Recortar</strong> en una página para quedarte solo con la foto (sin logo ni datos del proveedor).
+                Las <strong>📷 fotos originales</strong> se sacan limpias del PDF (sin los logos que el proveedor pone encima). Si una foto trae el logo pegado, usa <strong>🩹 Tapar logo</strong>; o <strong>✂️ Recortar</strong> para dejar solo una parte. También puedes subir tus propias fotos.
                 {itemPicker?.pagina_sugerida ? <> La IA sugiere la <strong>página {itemPicker.pagina_sugerida}</strong>{itemPicker.archivo ? ` de ${itemPicker.archivo}` : ""}.</> : null}
               </div>
-              {imgs.length === 0 && <div style={{ color:"#999", fontSize:"10pt" }}>No hay imágenes. Sube el portafolio en PDF o imágenes del proveedor.</div>}
+              <div style={{ marginBottom:"12px" }}>
+                <button onClick={()=>ownPhotoRef.current?.click()} style={{ background:BRAND.dorado, color:"#0d1f35", border:"none", padding:"7px 14px", borderRadius:"6px", cursor:"pointer", fontSize:"9pt", fontWeight:"700" }}>⬆️ Subir foto propia</button>
+                <input ref={ownPhotoRef} type="file" accept="image/*" multiple onChange={subirFotoPropia} style={{ display:"none" }}/>
+              </div>
+              {imgs.length === 0 && <div style={{ color:"#999", fontSize:"10pt" }}>No hay imágenes del proveedor. Sube una foto propia.</div>}
               <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fill, minmax(150px, 1fr))", gap:"12px" }}>
                 {imgs.map((im, k) => {
-                  const sugerida = itemPicker && im.pagina === itemPicker.pagina_sugerida && !im.recorte && (!itemPicker.archivo || im.archivo === itemPicker.archivo);
+                  const sugerida = itemPicker && im.pagina === itemPicker.pagina_sugerida && !im.recorte && im.foto && (!itemPicker.archivo || im.archivo === itemPicker.archivo);
                   return (
                     <div key={k} style={{ border: sugerida ? `2px solid ${BRAND.dorado}` : "1px solid #e0e0e0", borderRadius:"8px", overflow:"hidden" }}>
                       <img src={im.url} alt="" style={{ width:"100%", height:"120px", objectFit: im.recorte ? "cover" : "contain", background:"#f5f5f5", display:"block" }}/>
-                      <div style={{ fontSize:"7.5pt", color:"#888", padding:"4px 6px" }}>{im.recorte ? "✂️ Recorte" : `Pág. ${im.pagina}`}{sugerida ? " ⭐ sugerida" : ""}</div>
+                      <div style={{ fontSize:"7.5pt", color: im.foto || im.propia ? "#145a32" : "#888", padding:"4px 6px" }}>
+                        {im.propia ? "⬆️ Foto propia" : im.editada ? "🩹 Logo tapado" : im.recorte ? "✂️ Recorte" : im.foto ? `📷 Foto original · pág. ${im.pagina}` : `Página completa ${im.pagina}`}{sugerida ? " ⭐" : ""}
+                      </div>
                       <div style={{ display:"flex", borderTop:"1px solid #eee" }}>
                         <button onClick={()=>asignarImagen(k)} style={{ flex:1, background:"none", border:"none", borderRight:"1px solid #eee", padding:"6px", cursor:"pointer", fontSize:"8.5pt", color:BRAND.azul, fontWeight:"700" }}>Usar</button>
-                        <button onClick={()=>{ setCropIdx(k); setCropRect(null); }} style={{ flex:1, background:"none", border:"none", padding:"6px", cursor:"pointer", fontSize:"8.5pt", color:"#555" }}>✂️ Recortar</button>
+                        <button onClick={()=>{ setCropMode("recortar"); setCropIdx(k); setCropRect(null); }} title="Recortar" style={{ flex:1, background:"none", border:"none", borderRight:"1px solid #eee", padding:"6px", cursor:"pointer", fontSize:"8.5pt", color:"#555" }}>✂️</button>
+                        <button onClick={()=>{ setCropMode("tapar"); setCropIdx(k); setCropRect(null); }} title="Tapar logo" style={{ flex:1, background:"none", border:"none", padding:"6px", cursor:"pointer", fontSize:"8.5pt", color:"#555" }}>🩹</button>
                       </div>
                     </div>
                   );
@@ -1837,18 +1929,26 @@ ${photosHTML}
         {cropIdx !== null && imgs[cropIdx] && (
           <div style={{ position:"fixed", inset:0, background:"rgba(0,0,0,.75)", zIndex:300, display:"flex", alignItems:"center", justifyContent:"center", padding:"20px" }}>
             <div style={{ background:"white", borderRadius:"12px", padding:"18px", maxWidth:"95vw", maxHeight:"95vh", overflow:"auto" }}>
-              <div style={{ fontSize:"10pt", color:"#333", marginBottom:"10px" }}>✂️ <strong>Arrastra</strong> sobre la imagen para marcar el área que quieres usar.</div>
+              <div style={{ display:"flex", gap:"8px", marginBottom:"10px", alignItems:"center", flexWrap:"wrap" }}>
+                {[["recortar","✂️ Recortar"],["tapar","🩹 Tapar logo"]].map(([m,l]) => (
+                  <button key={m} onClick={()=>{ setCropMode(m); setCropRect(null); }} style={{ padding:"6px 12px", borderRadius:"6px", cursor:"pointer", fontSize:"9pt", fontWeight:"700",
+                    border: cropMode===m ? `2px solid ${BRAND.azul}` : "1px solid #ddd", background: cropMode===m ? "#f0fbfd" : "white", color: cropMode===m ? BRAND.azul : "#666" }}>{l}</button>
+                ))}
+                <span style={{ fontSize:"9.5pt", color:"#555" }}>
+                  {cropMode === "tapar" ? "Arrastra sobre el logo: esa zona se difumina con el fondo. Puedes repetirlo en la imagen resultante." : "Arrastra para marcar el área de la foto que quieres usar."}
+                </span>
+              </div>
               <div ref={cropBox} onMouseDown={onCropDown} onMouseMove={onCropMove} onMouseUp={onCropUp} onMouseLeave={onCropUp}
                 style={{ position:"relative", display:"inline-block", cursor:"crosshair", userSelect:"none" }}>
                 <img src={imgs[cropIdx].url} alt="" draggable={false} style={{ display:"block", maxWidth:"85vw", maxHeight:"70vh" }}/>
                 {cropRect && (
                   <div style={{ position:"absolute", left:`${cropRect.x*100}%`, top:`${cropRect.y*100}%`, width:`${cropRect.w*100}%`, height:`${cropRect.h*100}%`,
-                    border:`2px dashed ${BRAND.dorado}`, boxShadow:"0 0 0 9999px rgba(0,0,0,.45)", pointerEvents:"none" }}/>
+                    border:`2px dashed ${BRAND.dorado}`, boxShadow: cropMode === "tapar" ? "none" : "0 0 0 9999px rgba(0,0,0,.45)", background: cropMode === "tapar" ? "rgba(252,188,6,.25)" : "transparent", pointerEvents:"none" }}/>
                 )}
               </div>
               <div style={{ display:"flex", gap:"10px", justifyContent:"flex-end", marginTop:"12px" }}>
                 <button onClick={()=>{ setCropIdx(null); setCropRect(null); }} style={{ background:"none", border:"1px solid #ccc", padding:"7px 16px", borderRadius:"6px", cursor:"pointer" }}>Cancelar</button>
-                <button onClick={usarRecorte} style={{ background:BRAND.azul, color:"white", border:"none", padding:"8px 18px", borderRadius:"6px", cursor:"pointer", fontWeight:"700" }}>Usar recorte</button>
+                <button onClick={usarRecorte} style={{ background:BRAND.azul, color:"white", border:"none", padding:"8px 18px", borderRadius:"6px", cursor:"pointer", fontWeight:"700" }}>{cropMode === "tapar" ? "Tapar y usar" : "Usar recorte"}</button>
               </div>
             </div>
           </div>
