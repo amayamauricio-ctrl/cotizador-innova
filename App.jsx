@@ -76,6 +76,40 @@ const shrinkPdf = async (file) => {
   return blocks;
 };
 
+// Convierte las páginas de un PDF en imágenes JPEG (para el portafolio)
+const renderPdfPages = async (file, maxPages = 40, targetWidth = 1100) => {
+  const pdfjs = await loadPdfJs();
+  const pdf = await pdfjs.getDocument({ data: await toArrayBuffer(file) }).promise;
+  const out = [];
+  const total = Math.min(pdf.numPages, maxPages);
+  for (let p = 1; p <= total; p++) {
+    const page = await pdf.getPage(p);
+    const base = page.getViewport({ scale: 1 });
+    const viewport = page.getViewport({ scale: Math.min(2.5, targetWidth / base.width) });
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.round(viewport.width);
+    canvas.height = Math.round(viewport.height);
+    await page.render({ canvasContext: canvas.getContext("2d"), viewport }).promise;
+    out.push(canvas.toDataURL("image/jpeg", 0.75));
+  }
+  return out;
+};
+
+// Recorta una imagen (dataURL) a un rectángulo en coordenadas relativas 0..1
+const cropDataURL = (url, r) => new Promise((res, rej) => {
+  const img = new Image();
+  img.onload = () => {
+    const sx = Math.round(r.x * img.naturalWidth), sy = Math.round(r.y * img.naturalHeight);
+    const sw = Math.max(1, Math.round(r.w * img.naturalWidth)), sh = Math.max(1, Math.round(r.h * img.naturalHeight));
+    const c = document.createElement("canvas");
+    c.width = sw; c.height = sh;
+    c.getContext("2d").drawImage(img, sx, sy, sw, sh, 0, 0, sw, sh);
+    res(c.toDataURL("image/jpeg", 0.85));
+  };
+  img.onerror = rej;
+  img.src = url;
+});
+
 // Reduce una imagen pesada a máx. 2000 px y JPEG
 const compressImage = (file) => new Promise((res, rej) => {
   const img = new Image();
@@ -173,6 +207,7 @@ const TYPES = {
   evento:    { label:"Evento Corporativo",       icon:"🎪", color:BRAND.azul,   accent:BRAND.dorado },
   pop:       { label:"Material POP / Catálogo",  icon:"🎨", color:BRAND.dorado, accent:BRAND.azul   },
   servicios: { label:"Servicios", icon:"📣", color:BRAND.gris,   accent:BRAND.azul   },
+  portafolio:{ label:"Portafolio de Proveedor", icon:"📚", color:BRAND.azul, accent:BRAND.dorado },
 };
 
 // ─── PROMPTS ──────────────────────────────────────────────────────────────────
@@ -211,7 +246,28 @@ REGLAS:
 RESPONDE SOLO JSON válido sin texto adicional:
 {"tipo":"servicios","cliente":"","proyecto":"","periodo":"","contacto_comercial":"Mauricio Amaya","correo_contacto":"comercial@novainsight.club","telefono_contacto":"3028390022","alcance_secciones":[{"titulo":"","contenido":""}],"opciones":[{"titulo":"Propuesta de Servicios","items":[{"concepto":"","descripcion":"","cantidad":1,"v_unitario":0,"v_total":0}],"subtotal":0,"fee":0,"subtotal_con_fee":0,"iva":0,"total":0}]}`;
 
-const PROMPTS = { evento: PROMPT_EVENTO, pop: PROMPT_POP, servicios: PROMPT_SERVICIOS };
+const PROMPT_PORTAFOLIO = `Eres el editor comercial de Innova Insight SAS, agencia colombiana de eventos corporativos y experiencias BTL. Recibes el portafolio de un PROVEEDOR y debes convertirlo en un portafolio PROPIO de Innova Insight.
+
+REGLAS:
+- ELIMINA toda referencia al proveedor: nombre, marca, logo, NIT, teléfonos, correos, página web, redes sociales, direcciones y nombres de personas del proveedor. Nunca los menciones.
+- Reescribe los textos con la voz de Innova Insight (ej. "En Innova Insight diseñamos..."), en español, tono profesional y cálido, orientado a experiencias corporativas. No copies literal: parafrasea y mejora.
+- Organiza la oferta en categorías y servicios/productos. Conserva los datos útiles: qué incluye, duración, capacidad, requisitos, opciones.
+- precio_proveedor: el precio tal como aparece en el portafolio, en COP como número sin puntos. Si no hay precio, 0. unidad: "por persona", "por grupo", etc., si aplica.
+- archivo y pagina_sugerida: nombre del archivo y número de página (1 = primera) donde está la mejor imagen de ese servicio. 0 si no hay.
+- Nunca inventes servicios, precios ni datos.
+
+RESPONDE SOLO JSON válido sin texto adicional:
+{"tipo":"portafolio","titulo":"","subtitulo":"","intro":"","categorias":[{"nombre":"","items":[{"nombre":"","descripcion":"","incluye":[""],"detalles":"","precio_proveedor":0,"unidad":"","archivo":"","pagina_sugerida":0}]}],"notas":""}`;
+
+const PROMPTS = { evento: PROMPT_EVENTO, pop: PROMPT_POP, servicios: PROMPT_SERVICIOS, portafolio: PROMPT_PORTAFOLIO };
+
+// Precio al cliente en portafolio: manual, o precio proveedor + margen %
+const portPrecio = (d, it) => {
+  if (it.precio_manual) return Number(it.precio_cliente) || 0;
+  const base = Number(it.precio_proveedor) || 0;
+  return base > 0 ? Math.round(base * (1 + (Number(d.margen_pct) || 0) / 100) / 1000) * 1000 : 0;
+};
+const escHTML = (t) => String(t ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 
 // Modo "sin margen": Innova gana solo con fee + servicios propios
 const SIN_MARGEN_RULES = `
@@ -221,7 +277,7 @@ MODO SIN MARGEN (ESTA REGLA REEMPLAZA CUALQUIER REGLA DE MARGEN ANTERIOR):
 - No conviertas cortesías en cobros: si el proveedor da algo en cortesía, inclúyelo con valor 0 o no lo incluyas.
 - Innova solo gana con el fee y con sus servicios propios (por ejemplo "Coordinación de Evento"), que sí se incluyen con su valor normal.
 - Nunca inventes valores.`;
-const getPrompt = (tipo, sinMargen) => PROMPTS[tipo] + (sinMargen && tipo !== "pop" ? SIN_MARGEN_RULES : "");
+const getPrompt = (tipo, sinMargen) => PROMPTS[tipo] + (sinMargen && tipo !== "pop" && tipo !== "portafolio" ? SIN_MARGEN_RULES : "");
 
 // ─── RECALC ───────────────────────────────────────────────────────────────────
 // Helper: detectar si un ítem es de A&B
@@ -372,6 +428,12 @@ export default function InnovaV3() {
   const [historial, setHistorial] = useState([]);             // últimas 5 cotizaciones
   const [currentQuoteId, setCurrentQuoteId] = useState(null); // id si se está editando una guardada
   const [histMsg, setHistMsg] = useState("");
+  // Portafolio: selector de imagen y recorte
+  const [pickerFor, setPickerFor] = useState(null);   // {ci, ii}
+  const [cropIdx, setCropIdx] = useState(null);       // índice de imagen a recortar
+  const [cropRect, setCropRect] = useState(null);     // {x,y,w,h} relativos 0..1
+  const cropStart = useRef(null);
+  const cropBox = useRef(null);
   useEffect(() => { histList().then(setHistorial); }, []);
   const [logoDataURL, setLogoDataURL] = useState(LOGO_DEFAULT);
   const [extraInfo, setExtraInfo]     = useState("");
@@ -417,7 +479,7 @@ export default function InnovaV3() {
   // ── Build message content ──
   const buildContent = async (extra="") => {
     const blocks = [];
-    blocks.push({ type:"text", text:`Analiza la siguiente información y genera la cotización profesional de Innova Insight SAS.\n\nInformación del evento/cliente:\n${extraInfo}${extra ? `\n\nInformación complementaria:\n${extra}` : ""}${sinMargen && quoteType !== "pop" ? "\n\nIMPORTANTE: cotización SIN MARGEN sobre proveedores (usa los precios del proveedor tal cual)." : ""}${!(sinMargen && quoteType !== "pop") && presupuestoCliente && Number(presupuestoCliente) > 0 ? `\n\nPRESUPUESTO DEL CLIENTE: ${Number(presupuestoCliente).toLocaleString("es-CO")} COP (SIN IVA).\nEste presupuesto equivale a SUBTOTAL + FEE 16%. Es decir: Subtotal objetivo = ${Math.round(Number(presupuestoCliente) / 1.16 / 1000) * 1000} COP (presupuesto / 1.16).\nEl Subtotal incluye todos los ítems más el Servicio 10% sobre A&B.\nAjusta los precios de venta para llegar exactamente a este objetivo. Margen mínimo 30%.` : ""}` });
+    blocks.push({ type:"text", text:`Analiza la siguiente información y ${quoteType === "portafolio" ? "convierte este portafolio de proveedor en un portafolio de Innova Insight SAS" : "genera la cotización profesional de Innova Insight SAS"}.\n\nInformación del evento/cliente:\n${extraInfo}${extra ? `\n\nInformación complementaria:\n${extra}` : ""}${sinMargen && quoteType !== "pop" ? "\n\nIMPORTANTE: cotización SIN MARGEN sobre proveedores (usa los precios del proveedor tal cual)." : ""}${!(sinMargen && quoteType !== "pop") && presupuestoCliente && Number(presupuestoCliente) > 0 ? `\n\nPRESUPUESTO DEL CLIENTE: ${Number(presupuestoCliente).toLocaleString("es-CO")} COP (SIN IVA).\nEste presupuesto equivale a SUBTOTAL + FEE 16%. Es decir: Subtotal objetivo = ${Math.round(Number(presupuestoCliente) / 1.16 / 1000) * 1000} COP (presupuesto / 1.16).\nEl Subtotal incluye todos los ítems más el Servicio 10% sobre A&B.\nAjusta los precios de venta para llegar exactamente a este objetivo. Margen mínimo 30%.` : ""}` });
 
     if (providerEntries.length > 0) {
       blocks.push({ type:"text", text:`\n--- ARCHIVOS DEL PROVEEDOR (${providerEntries.length} archivos) ---` });
@@ -496,6 +558,53 @@ export default function InnovaV3() {
       const docTexto = wordTexts.join("\n\n---\n\n");
 
       const messages = await buildContent(extra);
+
+      if (quoteType === "portafolio") {
+        // 1) Páginas del PDF del proveedor → imágenes para elegir y recortar
+        const imagenes = [];
+        for (const entry of providerEntries) {
+          const f = entry.file;
+          try {
+            if (isPDF(f)) {
+              (await renderPdfPages(f)).forEach((url, k) => imagenes.push({ url, archivo: f.name, pagina: k + 1 }));
+            } else if (isImage(f)) {
+              const url = f.size > MAX_IMAGE_BYTES ? "data:image/jpeg;base64," + await compressImage(f) : await toDataURL(f);
+              imagenes.push({ url, archivo: f.name, pagina: 1 });
+            }
+          } catch (err) { console.error("[Cotizador] no se pudieron extraer imágenes de", f.name, err); }
+        }
+        // 2) La IA reescribe el portafolio con la voz de Innova
+        const resP = await fetchWithTimeout("https://api.anthropic.com/v1/messages", {
+          method:"POST",
+          headers:{ "Content-Type":"application/json", "x-api-key": apiKey, "anthropic-version": "2023-06-01", "anthropic-dangerous-direct-browser-access": "true" },
+          body: JSON.stringify({ model:"claude-sonnet-5-5", max_tokens:16000, system: PROMPTS.portafolio, messages }),
+        });
+        const respP = await resP.json();
+        if (respP.error) throw new Error(`[${resP.status} ${respP.error.type}] ${respP.error.message}`);
+        const parsedP = parseAIJson(respP);
+        parsedP.tipo = "portafolio";
+        parsedP.imagenes = imagenes;
+        parsedP.mostrar_precios = false;
+        parsedP.margen_pct = 30;
+        parsedP.contacto_comercial = "Mauricio Amaya";
+        parsedP.correo_contacto = "comercial@novainsight.club";
+        parsedP.telefono_contacto = "3028390022";
+        parsedP.categorias = (parsedP.categorias || []).map(c => ({
+          nombre: c.nombre || "",
+          items: (c.items || []).map(it => ({
+            nombre: it.nombre || "", descripcion: it.descripcion || "",
+            incluye: Array.isArray(it.incluye) ? it.incluye.filter(Boolean) : [],
+            detalles: it.detalles || "", unidad: it.unidad || "",
+            precio_proveedor: Number(it.precio_proveedor) || 0,
+            archivo: it.archivo || "", pagina_sugerida: Number(it.pagina_sugerida) || 0,
+            imagen: null,
+          })),
+        }));
+        setCurrentQuoteId(null);
+        setData(parsedP);
+        setStep("review");
+        return;
+      }
 
       if (quoteType === "servicios") {
         // Alcance y condiciones vienen del texto pegado por el usuario directamente
@@ -688,7 +797,7 @@ export default function InnovaV3() {
       const entry = {
         id, fecha: Date.now(), tipo: data.tipo,
         cliente: data.cliente || "Sin cliente",
-        titulo: data.evento || data.campana || data.proyecto || "",
+        titulo: data.evento || data.campana || data.proyecto || data.titulo || "",
         opciones: data.opciones?.length || 0,
         total: totales.length ? Math.max(...totales) : 0,
         data: JSON.parse(JSON.stringify(data)),
@@ -721,7 +830,7 @@ export default function InnovaV3() {
 
     const pf = (d) => `
       <div class="pg-footer">
-        <span>${d.cliente||""} — Documento Confidencial</span>
+        <span>${d.cliente ? `${d.cliente} — ` : ""}Documento Confidencial</span>
         <span>Innova Insight SAS</span>
       </div>`;
 
@@ -798,9 +907,10 @@ export default function InnovaV3() {
       </div>`;
 
     // Cover fields
-    const coverTitle = data.evento || data.campana || data.proyecto || "PENDIENTE";
+    const isPortafolio = data.tipo === "portafolio";
+    const coverTitle = isPortafolio ? (data.titulo || "Portafolio de servicios") : (data.evento || data.campana || data.proyecto || "PENDIENTE");
     const coverSub = data.tipo==="evento" ? data.lugar_general||"" : data.tipo==="pop" ? `Entrega: ${data.fecha_entrega||"PENDIENTE"}` : data.periodo||"";
-    const coverMeta = data.tipo==="evento"
+    const coverMeta = isPortafolio ? [] : data.tipo==="evento"
       ? [["Fecha",data.fecha_evento],["Asistentes",data.personas?`${data.personas} pers.`:""]]
       : data.tipo==="pop"
         ? [["Entrega",data.fecha_entrega],["Campaña",data.campana]]
@@ -854,6 +964,57 @@ export default function InnovaV3() {
 
     // Fotos sin opción asignada
     const photosHTML = buildPhotosPages("Fotografías del Espacio", eventPhotos.filter(p => fotoOpcion(p) === null));
+
+    // Páginas del portafolio (4 servicios por página)
+    const buildPortfolioPages = () => {
+      const imgs = data.imagenes || [];
+      const cats = (data.categorias || []).filter(c => c.items?.length);
+      const card = (it) => {
+        const img = Number.isInteger(it.imagen) && imgs[it.imagen] ? imgs[it.imagen].url : "";
+        const precio = data.mostrar_precios ? portPrecio(data, it) : 0;
+        return `
+          <div class="pt-card">
+            ${img ? `<img class="pt-img" src="${img}" alt=""/>` : ""}
+            <div class="pt-body">
+              <div class="pt-name">${escHTML(it.nombre)}</div>
+              ${it.descripcion ? `<div class="pt-desc">${escHTML(it.descripcion)}</div>` : ""}
+              ${it.incluye?.filter(Boolean).length ? `<ul class="pt-inc">${it.incluye.filter(Boolean).map(x => `<li>${escHTML(x)}</li>`).join("")}</ul>` : ""}
+              ${it.detalles ? `<div class="pt-det">${escHTML(it.detalles)}</div>` : ""}
+              ${precio > 0 ? `<div class="pt-price">${COP(precio)} <span>${escHTML(it.unidad || "")} · antes de IVA</span></div>` : ""}
+            </div>
+          </div>`;
+      };
+      const intro = `
+      <div class="page">
+        ${ph(today)}
+        <h2 class="section-title">${escHTML(data.titulo || "Portafolio de servicios")}</h2>
+        ${data.intro ? `<div class="pt-intro">${escHTML(data.intro)}</div>` : ""}
+        ${cats.length ? `<h4 style="font-size:9pt;color:${BRAND.gris};text-transform:uppercase;letter-spacing:1px;margin-top:10px">Lo que ofrecemos</h4>
+        <div class="pt-cats">${cats.map(c => `<span class="pt-cat-chip">${escHTML(c.nombre)}</span>`).join("")}</div>` : ""}
+        ${pf(data)}
+      </div>`;
+      const catPages = cats.map(c => {
+        const grupos = [];
+        for (let k = 0; k < c.items.length; k += 4) grupos.push(c.items.slice(k, k + 4));
+        return grupos.map((g, gi) => `
+      <div class="page">
+        ${ph(today)}
+        <h2 class="section-title">${escHTML(c.nombre)}${grupos.length > 1 ? ` <span style="font-size:10pt;color:#aaa">(${gi + 1}/${grupos.length})</span>` : ""}</h2>
+        <div class="pt-grid">${g.map(card).join("")}</div>
+        ${pf(data)}
+      </div>`).join("");
+      }).join("");
+      const cierre = `
+      <div class="page">
+        ${ph(today)}
+        <div class="cond-title">Condiciones y contacto</div>
+        ${data.notas ? `<div class="cond-item"><h4>Notas</h4><p style="white-space:pre-line">${escHTML(data.notas)}</p></div>` : ""}
+        ${data.mostrar_precios ? `<div class="cond-item"><h4>Valores</h4><p>Valores expresados en <strong>Pesos Colombianos (COP)</strong>, antes de IVA. Sujetos a disponibilidad y confirmación al momento de la cotización formal.</p></div>` : `<div class="cond-item"><h4>Valores</h4><p>Los valores se entregan en una <strong>cotización formal</strong> según el número de participantes, fecha y requerimientos de su evento.</p></div>`}
+        <div class="cond-item"><h4>Contáctenos</h4><p><strong>${escHTML(data.contacto_comercial || "")}</strong> · ${escHTML(data.correo_contacto || "")} · ${escHTML(data.telefono_contacto || "")}</p></div>
+        ${pf(data)}
+      </div>`;
+      return intro + catPages + cierre;
+    };
 
     return `<!DOCTYPE html>
 <html lang="es">
@@ -971,6 +1132,20 @@ body{font-family:'Nunito','Century Gothic',Arial,sans-serif;font-size:10.5pt;col
   .toolbar,.gap{display:none}
   .page{margin:0;box-shadow:none;page-break-after:always}
 }
+/* portafolio */
+.pt-intro{font-size:11pt;line-height:1.75;color:#444;white-space:pre-line;margin:6px 0 18px}
+.pt-cats{display:flex;flex-wrap:wrap;gap:8px;margin-top:8px}
+.pt-cat-chip{background:#f0fbfd;border:1px solid #cdeef3;border-radius:14px;padding:4px 12px;font-size:9pt;color:${BRAND.azul};font-weight:700}
+.pt-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:6px}
+.pt-card{border:1px solid #e6eef0;border-radius:10px;overflow:hidden;break-inside:avoid;background:white}
+.pt-img{width:100%;height:150px;object-fit:cover;display:block;background:#f3f6f7}
+.pt-body{padding:12px 14px}
+.pt-name{font-size:11pt;font-weight:800;color:${BRAND.gris};margin-bottom:4px}
+.pt-desc{font-size:9pt;color:#555;line-height:1.55;margin-bottom:6px}
+.pt-inc{font-size:8.5pt;color:#555;margin:0 0 6px 16px;line-height:1.5}
+.pt-det{font-size:8.5pt;color:#888;margin-bottom:6px}
+.pt-price{font-size:11pt;font-weight:800;color:${BRAND.azul};border-top:1px dashed #e0e0e0;padding-top:6px}
+.pt-price span{font-size:8pt;font-weight:400;color:#888}
 </style>
 </head>
 <body>
@@ -995,9 +1170,13 @@ body{font-family:'Nunito','Century Gothic',Arial,sans-serif;font-size:10.5pt;col
     </div>
     <div class="cover-tag">${T.icon} ${T.label}</div>
     <div class="cover-content">
+      ${isPortafolio ? `
+      <div class="cover-for">${data.cliente ? `Portafolio preparado para ${escHTML(data.cliente)}` : "Portafolio de servicios"}</div>
+      <div class="cover-client">${escHTML(coverTitle)}</div>
+      <div class="cover-event">${escHTML(data.subtitulo || "")}</div>` : `
       <div class="cover-for">Propuesta comercial para</div>
       <div class="cover-client">${data.cliente||"PENDIENTE"}</div>
-      <div class="cover-event">${coverTitle}${coverSub ? ` · ${coverSub}` : ""}</div>
+      <div class="cover-event">${coverTitle}${coverSub ? ` · ${coverSub}` : ""}</div>`}
       <div class="cover-chips">
         ${coverMeta.filter(([,v])=>v).map(([l,v])=>`<div class="chip"><div class="chip-l">${l}</div><div class="chip-v">${v}</div></div>`).join("")}
       </div>
@@ -1012,6 +1191,7 @@ body{font-family:'Nunito','Century Gothic',Arial,sans-serif;font-size:10.5pt;col
   </div>
 </div>
 
+${isPortafolio ? buildPortfolioPages() : `
 <!-- ALCANCE (solo servicios) -->
 ${alcancePage}
 
@@ -1047,6 +1227,7 @@ ${photosHTML}
   </div>
   ${pf(data)}
 </div>
+`}
 </body></html>`;
   };
 
@@ -1226,7 +1407,7 @@ ${photosHTML}
         {/* Type selector */}
         <div style={{ marginBottom:"18px" }}>
           <div style={{ color:"#f0a500", fontSize:"8pt", textTransform:"uppercase", letterSpacing:"2px", marginBottom:"10px" }}>Tipo de cotización</div>
-          <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr 1fr", gap:"10px" }}>
+          <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fit, minmax(150px, 1fr))", gap:"10px" }}>
             {Object.entries(TYPES).map(([key, info]) => (
               <button key={key} onClick={()=>setQuoteType(key)} style={{
                 background: quoteType===key ? "white" : "rgba(255,255,255,.07)",
@@ -1285,6 +1466,7 @@ ${photosHTML}
         </div>
 
         {/* Photos */}
+        {quoteType !== "portafolio" && (
         <div style={{ marginBottom:"18px" }}>
           <div style={{ color:"#f0a500", fontSize:"8pt", textTransform:"uppercase", letterSpacing:"2px", marginBottom:"10px" }}>
             Fotografías del espacio <span style={{ color:"#7aaed4", textTransform:"none", letterSpacing:0 }}>(opcional)</span>
@@ -1302,6 +1484,7 @@ ${photosHTML}
             ))}
           </div>
         </div>
+        )}
 
         {/* Alcance y Condiciones — solo servicios */}
         {quoteType==="servicios" && (
@@ -1342,7 +1525,9 @@ ${photosHTML}
         <div style={{ marginBottom:"22px" }}>
           <div style={{ color:"#f0a500", fontSize:"8pt", textTransform:"uppercase", letterSpacing:"2px", marginBottom:"10px" }}>Información del cliente / evento</div>
           <textarea value={extraInfo} onChange={e=>setExtraInfo(e.target.value)}
-            placeholder={quoteType==="evento"
+            placeholder={quoteType==="portafolio"
+              ? "Opcional:\nCliente para quien se prepara: Empresa XYZ\nEnfoque: experiencias gastronómicas para equipos de tecnología\nTítulo deseado: Experiencias Culinarias 2027"
+              : quoteType==="evento"
               ? "Cliente: Empresa XYZ\nEvento: Cena de fin de año\nFecha: 12 dic 2025\nPersonas: 80\nContacto Innova: Juan Pérez / juan@innovainsight.co / 310-000-0000"
               : quoteType==="pop"
                 ? "Cliente: Empresa XYZ\nCampaña: Lanzamiento producto\nFecha entrega: 30 nov 2025\nContacto Innova: Juan Pérez / juan@innovainsight.co"
@@ -1351,7 +1536,7 @@ ${photosHTML}
         </div>
 
         {/* Margen sobre proveedor */}
-        {(
+        {quoteType !== "portafolio" && (
 
           <div style={{ marginBottom:"18px", background:"rgba(255,255,255,.06)", border:"1px solid rgba(255,255,255,.14)", borderRadius:"10px", padding:"14px 16px" }}>
             <div style={{ color:"#f0a500", fontSize:"8pt", textTransform:"uppercase", letterSpacing:"2px", marginBottom:"10px" }}>📊 Margen sobre el proveedor</div>
@@ -1375,7 +1560,7 @@ ${photosHTML}
         )}
 
         {/* Presupuesto del cliente */}
-        {quoteType !== "pop" && !sinMargen && (
+        {quoteType !== "pop" && quoteType !== "portafolio" && !sinMargen && (
           <div style={{ marginBottom:"18px", background:"rgba(255,255,255,.06)", border:"1px solid rgba(255,255,255,.14)", borderRadius:"10px", padding:"14px 16px" }}>
             <div style={{ color:"#f0a500", fontSize:"8pt", textTransform:"uppercase", letterSpacing:"2px", marginBottom:"8px" }}>💰 Presupuesto del cliente (opcional)</div>
             <div style={{ display:"flex", alignItems:"center", gap:"12px" }}>
@@ -1469,6 +1654,208 @@ ${photosHTML}
       </div>
     </div>
   );
+
+  // ─── REVIEW: PORTAFOLIO ───────────────────────────────────────────────────
+  if (step==="review" && data && data.tipo==="portafolio") {
+    const imgs = data.imagenes || [];
+    const upd = (fn) => { const d = JSON.parse(JSON.stringify(data)); fn(d); setData(d); };
+    const updItem = (ci, ii, field, val) => upd(d => {
+      const it = d.categorias[ci].items[ii];
+      if (field === "precio_cliente") { it.precio_cliente = Number(val) || 0; it.precio_manual = true; }
+      else if (field === "reset_precio") { it.precio_manual = false; }
+      else if (field === "incluye") { it.incluye = val.split("\n"); }
+      else if (field === "precio_proveedor") { it.precio_proveedor = Number(val) || 0; }
+      else it[field] = val;
+    });
+    const asignarImagen = (idx) => { const t = pickerFor; upd(d => { d.categorias[t.ci].items[t.ii].imagen = idx; }); setPickerFor(null); };
+    const relPos = (e) => {
+      const r = cropBox.current.getBoundingClientRect();
+      return { x: Math.min(1, Math.max(0, (e.clientX - r.left) / r.width)), y: Math.min(1, Math.max(0, (e.clientY - r.top) / r.height)) };
+    };
+    const onCropDown = (e) => { e.preventDefault(); cropStart.current = relPos(e); setCropRect(null); };
+    const onCropMove = (e) => {
+      if (!cropStart.current) return;
+      const a = cropStart.current, b = relPos(e);
+      setCropRect({ x: Math.min(a.x, b.x), y: Math.min(a.y, b.y), w: Math.abs(b.x - a.x), h: Math.abs(b.y - a.y) });
+    };
+    const onCropUp = () => { cropStart.current = null; };
+    const usarRecorte = async () => {
+      if (!cropRect || cropRect.w < 0.02 || cropRect.h < 0.02) { alert("Arrastra sobre la imagen para marcar el área a recortar."); return; }
+      const url = await cropDataURL(imgs[cropIdx].url, cropRect);
+      const src = imgs[cropIdx];
+      const t = pickerFor;
+      upd(d => {
+        d.imagenes.push({ url, archivo: src.archivo, pagina: src.pagina, recorte: true });
+        if (t) d.categorias[t.ci].items[t.ii].imagen = d.imagenes.length - 1;
+      });
+      setCropIdx(null); setCropRect(null); setPickerFor(null);
+    };
+    const inp = { width:"100%", boxSizing:"border-box", padding:"7px 10px", border:"1px solid #e0e0e0", borderRadius:"6px", fontSize:"10pt", fontFamily:"inherit" };
+    const card = { background:"white", borderRadius:"10px", padding:"20px 22px", marginBottom:"14px", boxShadow:"0 2px 8px rgba(0,0,0,.06)" };
+    const itemPicker = pickerFor ? data.categorias[pickerFor.ci]?.items[pickerFor.ii] : null;
+
+    return (
+      <div style={{ minHeight:"100vh", background:"#eef0f4", fontFamily:"'Plus Jakarta Sans',Arial,sans-serif" }}>
+        <div style={{ background:"#0d1f35", padding:"12px 24px", display:"flex", justifyContent:"space-between", alignItems:"center", position:"sticky", top:0, zIndex:100 }}>
+          <div>
+            <span style={{ fontFamily:"Georgia,serif", fontWeight:"900", fontSize:"14pt", color:"white" }}>INNOVA <span style={{ color:"#f0a500" }}>INSIGHT</span></span>
+            <span style={{ marginLeft:"14px", color:"#7aaed4", fontSize:"9pt" }}>📚 Portafolio · Revisión</span>
+            {currentQuoteId && <span style={{ marginLeft:"10px", background:"rgba(255,255,255,.12)", color:"#aac4e0", fontSize:"8pt", padding:"2px 8px", borderRadius:"10px" }}>✏️ Editando portafolio guardado</span>}
+          </div>
+          <div style={{ display:"flex", gap:"10px" }}>
+            <button onClick={()=>setStep("input")} style={{ background:"transparent", border:"1px solid rgba(255,255,255,.2)", color:"#aac4e0", padding:"7px 14px", borderRadius:"6px", cursor:"pointer", fontSize:"9pt" }}>← Nueva</button>
+            <button onClick={generatePDF} style={{ background:"#f0a500", color:"#0d1f35", border:"none", padding:"8px 22px", borderRadius:"6px", fontWeight:"700", cursor:"pointer" }}>📄 Generar Portafolio</button>
+          </div>
+        </div>
+
+        <div style={{ maxWidth:"980px", margin:"24px auto", padding:"0 16px" }}>
+          <div style={{ background:"#fff8e1", border:"1px solid #f0c040", borderRadius:"8px", padding:"10px 14px", marginBottom:"14px", fontSize:"9pt", color:"#8a6000" }}>
+            🔒 La IA quitó el nombre y los datos del proveedor de los textos. <strong>Revisa las imágenes</strong>: las páginas del PDF pueden traer su logo o contacto — usa <strong>✂️ Recortar</strong> para dejar solo la foto.
+          </div>
+
+          <div style={card}>
+            <h2 style={{ color:BRAND.azul, fontSize:"12pt", marginBottom:"14px" }}>Portada e introducción</h2>
+            <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:"12px", marginBottom:"12px" }}>
+              <div><label style={{ fontSize:"8pt", color:"#999" }}>TÍTULO</label><input value={data.titulo||""} onChange={e=>upd(d=>{d.titulo=e.target.value})} style={inp}/></div>
+              <div><label style={{ fontSize:"8pt", color:"#999" }}>SUBTÍTULO</label><input value={data.subtitulo||""} onChange={e=>upd(d=>{d.subtitulo=e.target.value})} style={inp}/></div>
+              <div><label style={{ fontSize:"8pt", color:"#999" }}>PREPARADO PARA (OPCIONAL)</label><input value={data.cliente||""} onChange={e=>upd(d=>{d.cliente=e.target.value})} placeholder="Nombre del cliente" style={inp}/></div>
+            </div>
+            <label style={{ fontSize:"8pt", color:"#999" }}>INTRODUCCIÓN</label>
+            <textarea value={data.intro||""} onChange={e=>upd(d=>{d.intro=e.target.value})} style={{ ...inp, minHeight:"90px", resize:"vertical" }}/>
+          </div>
+
+          <div style={{ ...card, display:"flex", alignItems:"center", gap:"18px", flexWrap:"wrap" }}>
+            <div style={{ flex:1, minWidth:"220px" }}>
+              <div style={{ fontWeight:"700", color:BRAND.azul, fontSize:"11pt" }}>💲 Precios en el portafolio</div>
+              <div style={{ fontSize:"9pt", color:"#888", marginTop:"2px" }}>{data.mostrar_precios ? "Se muestran precios (proveedor + tu margen), antes de IVA." : "Sin precios: el cliente pide cotización formal."}</div>
+            </div>
+            {data.mostrar_precios && (
+              <label style={{ fontSize:"9pt", color:"#555", display:"flex", alignItems:"center", gap:"6px" }}>
+                Margen %
+                <input type="number" value={data.margen_pct ?? 30} onChange={e=>upd(d=>{d.margen_pct=Number(e.target.value)})} style={{ ...inp, width:"80px", textAlign:"right" }}/>
+              </label>
+            )}
+            <div onClick={()=>upd(d=>{d.mostrar_precios=!d.mostrar_precios})} style={{ cursor:"pointer", display:"flex", alignItems:"center", gap:"8px" }}>
+              <span style={{ fontSize:"9pt", fontWeight:"600", color: data.mostrar_precios ? "#145a32" : "#aaa" }}>{data.mostrar_precios ? "Con precios" : "Sin precios"}</span>
+              <div style={{ width:"46px", height:"26px", borderRadius:"13px", background: data.mostrar_precios ? "#27ae60" : "#ccc", position:"relative" }}>
+                <div style={{ position:"absolute", top:"3px", left: data.mostrar_precios ? "23px" : "3px", width:"20px", height:"20px", borderRadius:"50%", background:"white", transition:"left .2s" }}/>
+              </div>
+            </div>
+          </div>
+
+          {(data.categorias||[]).map((cat, ci) => (
+            <div key={ci} style={card}>
+              <div style={{ display:"flex", gap:"10px", alignItems:"center", borderBottom:`2px solid ${BRAND.dorado}`, paddingBottom:"8px", marginBottom:"14px" }}>
+                <input value={cat.nombre} onChange={e=>upd(d=>{d.categorias[ci].nombre=e.target.value})} placeholder="Nombre de la categoría"
+                  style={{ flex:1, fontSize:"13pt", fontWeight:"700", color:BRAND.azul, border:"none", outline:"none", fontFamily:"inherit" }}/>
+                <button onClick={()=>{ if (window.confirm("¿Eliminar esta categoría y sus servicios?")) upd(d=>{d.categorias.splice(ci,1)}); }} style={{ background:"none", border:"none", color:"#ccc", cursor:"pointer", fontSize:"14pt" }}>×</button>
+              </div>
+              <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fill, minmax(280px, 1fr))", gap:"14px" }}>
+                {cat.items.map((it, ii) => {
+                  const img = Number.isInteger(it.imagen) && imgs[it.imagen] ? imgs[it.imagen] : null;
+                  const precio = portPrecio(data, it);
+                  return (
+                    <div key={ii} style={{ border:"1px solid #e8e8e8", borderRadius:"8px", overflow:"hidden" }}>
+                      <div onClick={()=>setPickerFor({ ci, ii })} style={{ height:"130px", background: img ? `center/cover no-repeat url(${img.url})` : "#f3f6f7", cursor:"pointer", display:"flex", alignItems:"flex-end", justifyContent:"flex-end", padding:"6px" }}>
+                        <span style={{ background:"rgba(13,31,53,.75)", color:"white", fontSize:"8pt", padding:"3px 8px", borderRadius:"10px" }}>
+                          {img ? (img.recorte ? "🖼️ Cambiar imagen" : "⚠️ Página completa — recortar") : "📷 Elegir imagen"}
+                        </span>
+                      </div>
+                      <div style={{ padding:"10px 12px", display:"flex", flexDirection:"column", gap:"6px" }}>
+                        <div style={{ display:"flex", gap:"6px" }}>
+                          <input value={it.nombre} onChange={e=>updItem(ci,ii,"nombre",e.target.value)} placeholder="Nombre del servicio" style={{ ...inp, fontWeight:"700" }}/>
+                          <button onClick={()=>upd(d=>{d.categorias[ci].items.splice(ii,1)})} title="Eliminar" style={{ background:"none", border:"none", color:"#ccc", cursor:"pointer", fontSize:"14pt" }}>×</button>
+                        </div>
+                        <textarea value={it.descripcion} onChange={e=>updItem(ci,ii,"descripcion",e.target.value)} placeholder="Descripción" style={{ ...inp, minHeight:"60px", fontSize:"9pt", resize:"vertical" }}/>
+                        <textarea value={(it.incluye||[]).join("\n")} onChange={e=>updItem(ci,ii,"incluye",e.target.value)} placeholder="Incluye (uno por línea)" style={{ ...inp, minHeight:"50px", fontSize:"9pt", resize:"vertical" }}/>
+                        <input value={it.detalles||""} onChange={e=>updItem(ci,ii,"detalles",e.target.value)} placeholder="Detalles (duración, capacidad...)" style={{ ...inp, fontSize:"9pt" }}/>
+                        {data.mostrar_precios && (
+                          <div style={{ background: it.precio_manual ? "#fff4e5" : "#f0fbfd", borderRadius:"6px", padding:"8px", display:"grid", gridTemplateColumns:"1fr 1fr", gap:"6px", fontSize:"8pt", color:"#666" }}>
+                            <label>Precio proveedor<input type="number" value={it.precio_proveedor||""} onChange={e=>updItem(ci,ii,"precio_proveedor",e.target.value)} style={{ ...inp, fontSize:"9pt" }}/></label>
+                            <label>Precio cliente {it.precio_manual ? "(manual)" : `(+${data.margen_pct ?? 0}%)`}<input type="number" value={precio||""} onChange={e=>updItem(ci,ii,"precio_cliente",e.target.value)} style={{ ...inp, fontSize:"9pt", fontWeight:"700", color:BRAND.azul }}/></label>
+                            <label>Unidad<input value={it.unidad||""} onChange={e=>updItem(ci,ii,"unidad",e.target.value)} placeholder="por persona" style={{ ...inp, fontSize:"9pt" }}/></label>
+                            {it.precio_manual && <button onClick={()=>updItem(ci,ii,"reset_precio")} style={{ alignSelf:"end", background:"none", border:"none", color:BRAND.azul, cursor:"pointer", textDecoration:"underline", fontSize:"8pt" }}>↺ Usar margen</button>}
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+              <button onClick={()=>upd(d=>{d.categorias[ci].items.push({ nombre:"", descripcion:"", incluye:[], detalles:"", unidad:"", precio_proveedor:0, imagen:null })})}
+                style={{ marginTop:"12px", background:"transparent", border:`1px dashed ${BRAND.azul}`, color:BRAND.azul, padding:"6px 14px", borderRadius:"6px", cursor:"pointer", fontSize:"9pt" }}>+ Agregar servicio</button>
+            </div>
+          ))}
+
+          <button onClick={()=>upd(d=>{ d.categorias = d.categorias || []; d.categorias.push({ nombre:"Nueva categoría", items:[] }); })}
+            style={{ width:"100%", background:"transparent", border:`1px dashed ${BRAND.azul}`, color:BRAND.azul, padding:"10px", borderRadius:"8px", cursor:"pointer", fontSize:"10pt", fontWeight:"600", marginBottom:"14px" }}>+ Agregar categoría</button>
+
+          <div style={card}>
+            <h2 style={{ color:BRAND.azul, fontSize:"12pt", marginBottom:"8px" }}>Notas finales (opcional)</h2>
+            <textarea value={data.notas||""} onChange={e=>upd(d=>{d.notas=e.target.value})} placeholder="Ej: Experiencias disponibles en Bogotá y Medellín. Grupos desde 10 personas." style={{ ...inp, minHeight:"70px", resize:"vertical" }}/>
+          </div>
+
+          <button onClick={generatePDF} style={{ width:"100%", background:BRAND.azul, color:"white", border:"none", padding:"15px", borderRadius:"10px", fontSize:"13pt", fontWeight:"700", cursor:"pointer", marginBottom:"40px" }}>📄 Generar Portafolio</button>
+        </div>
+
+        {/* Selector de imagen */}
+        {pickerFor && cropIdx === null && (
+          <div onClick={()=>setPickerFor(null)} style={{ position:"fixed", inset:0, background:"rgba(0,0,0,.6)", zIndex:200, display:"flex", alignItems:"center", justifyContent:"center", padding:"20px" }}>
+            <div onClick={e=>e.stopPropagation()} style={{ background:"white", borderRadius:"12px", padding:"20px", maxWidth:"900px", width:"100%", maxHeight:"85vh", overflow:"auto" }}>
+              <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:"6px" }}>
+                <h3 style={{ color:BRAND.azul, fontSize:"12pt" }}>Imagen para: {itemPicker?.nombre || "servicio"}</h3>
+                <button onClick={()=>setPickerFor(null)} style={{ background:"none", border:"none", fontSize:"16pt", cursor:"pointer", color:"#999" }}>×</button>
+              </div>
+              <div style={{ fontSize:"8.5pt", color:"#888", marginBottom:"12px" }}>
+                Usa <strong>✂️ Recortar</strong> en una página para quedarte solo con la foto (sin logo ni datos del proveedor).
+                {itemPicker?.pagina_sugerida ? <> La IA sugiere la <strong>página {itemPicker.pagina_sugerida}</strong>{itemPicker.archivo ? ` de ${itemPicker.archivo}` : ""}.</> : null}
+              </div>
+              {imgs.length === 0 && <div style={{ color:"#999", fontSize:"10pt" }}>No hay imágenes. Sube el portafolio en PDF o imágenes del proveedor.</div>}
+              <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fill, minmax(150px, 1fr))", gap:"12px" }}>
+                {imgs.map((im, k) => {
+                  const sugerida = itemPicker && im.pagina === itemPicker.pagina_sugerida && !im.recorte && (!itemPicker.archivo || im.archivo === itemPicker.archivo);
+                  return (
+                    <div key={k} style={{ border: sugerida ? `2px solid ${BRAND.dorado}` : "1px solid #e0e0e0", borderRadius:"8px", overflow:"hidden" }}>
+                      <img src={im.url} alt="" style={{ width:"100%", height:"120px", objectFit: im.recorte ? "cover" : "contain", background:"#f5f5f5", display:"block" }}/>
+                      <div style={{ fontSize:"7.5pt", color:"#888", padding:"4px 6px" }}>{im.recorte ? "✂️ Recorte" : `Pág. ${im.pagina}`}{sugerida ? " ⭐ sugerida" : ""}</div>
+                      <div style={{ display:"flex", borderTop:"1px solid #eee" }}>
+                        <button onClick={()=>asignarImagen(k)} style={{ flex:1, background:"none", border:"none", borderRight:"1px solid #eee", padding:"6px", cursor:"pointer", fontSize:"8.5pt", color:BRAND.azul, fontWeight:"700" }}>Usar</button>
+                        <button onClick={()=>{ setCropIdx(k); setCropRect(null); }} style={{ flex:1, background:"none", border:"none", padding:"6px", cursor:"pointer", fontSize:"8.5pt", color:"#555" }}>✂️ Recortar</button>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+              {Number.isInteger(itemPicker?.imagen) && (
+                <button onClick={()=>asignarImagen(null)} style={{ marginTop:"14px", background:"none", border:"1px solid #e74c3c", color:"#e74c3c", padding:"6px 14px", borderRadius:"6px", cursor:"pointer", fontSize:"9pt" }}>Quitar imagen</button>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* Recorte */}
+        {cropIdx !== null && imgs[cropIdx] && (
+          <div style={{ position:"fixed", inset:0, background:"rgba(0,0,0,.75)", zIndex:300, display:"flex", alignItems:"center", justifyContent:"center", padding:"20px" }}>
+            <div style={{ background:"white", borderRadius:"12px", padding:"18px", maxWidth:"95vw", maxHeight:"95vh", overflow:"auto" }}>
+              <div style={{ fontSize:"10pt", color:"#333", marginBottom:"10px" }}>✂️ <strong>Arrastra</strong> sobre la imagen para marcar el área que quieres usar.</div>
+              <div ref={cropBox} onMouseDown={onCropDown} onMouseMove={onCropMove} onMouseUp={onCropUp} onMouseLeave={onCropUp}
+                style={{ position:"relative", display:"inline-block", cursor:"crosshair", userSelect:"none" }}>
+                <img src={imgs[cropIdx].url} alt="" draggable={false} style={{ display:"block", maxWidth:"85vw", maxHeight:"70vh" }}/>
+                {cropRect && (
+                  <div style={{ position:"absolute", left:`${cropRect.x*100}%`, top:`${cropRect.y*100}%`, width:`${cropRect.w*100}%`, height:`${cropRect.h*100}%`,
+                    border:`2px dashed ${BRAND.dorado}`, boxShadow:"0 0 0 9999px rgba(0,0,0,.45)", pointerEvents:"none" }}/>
+                )}
+              </div>
+              <div style={{ display:"flex", gap:"10px", justifyContent:"flex-end", marginTop:"12px" }}>
+                <button onClick={()=>{ setCropIdx(null); setCropRect(null); }} style={{ background:"none", border:"1px solid #ccc", padding:"7px 16px", borderRadius:"6px", cursor:"pointer" }}>Cancelar</button>
+                <button onClick={usarRecorte} style={{ background:BRAND.azul, color:"white", border:"none", padding:"8px 18px", borderRadius:"6px", cursor:"pointer", fontWeight:"700" }}>Usar recorte</button>
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+    );
+  }
 
   // ─── REVIEW ───────────────────────────────────────────────────────────────
   if (step==="review" && data) {
